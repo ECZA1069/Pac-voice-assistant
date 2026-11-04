@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PAC - voice assistant with AR</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:680px;margin:40px auto;padding:0 16px;line-height:1.55;color:#1b2430}
+a.btn{display:inline-block;background:#1a8cff;color:#fff;padding:12px 22px;border-radius:8px;text-decoration:none;font-weight:600}
+code{background:#eef2f6;padding:2px 6px;border-radius:4px} .sum{word-break:break-all;font-size:.85em}
+</style></head><body>
+<h1>PAC</h1>
+<p>A desktop voice assistant for Windows with augmented reality: show it an object, teach it a name, and it recognises it again.</p>
+<p><a class="btn" id="dl" href="#">Download for Windows</a> <span id="ver"></span></p>
+<p class="sum">SHA256: <span id="sha">loading...</span></p>
+<h2>Install</h2>
+<ol><li>Download and unzip.</li><li>Run <code>PAC.exe</code>. If Windows SmartScreen warns, choose More info, then Run anyway (the app is not code-signed yet).</li><li>Allow camera and microphone access.</li><li>Open Menu &gt; Augmented reality to start.</li></ol>
+<p>Needs Windows 10 or 11, a webcam and a microphone. PAC updates itself: it checks this site for new versions.</p>
+<h2>Privacy</h2>
+<p>Everything stays on your laptop. PAC keeps only numbers describing objects you teach it, never pictures. This site does not track you.</p>
+<script>
+fetch("version.json",{cache:"no-store"}).then(r=>r.json()).then(v=>{
+ document.getElementById("dl").href=v.url;
+ document.getElementById("ver").textContent="Version "+v.version;
+ document.getElementById("sha").textContent=v.sha256;
+}).catch(()=>{document.getElementById("sha").textContent="unavailable"});
+</script>
+</body></html>

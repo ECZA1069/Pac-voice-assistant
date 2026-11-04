@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+
+# Credentials & local state (NEVER commit secrets)
+.env
+credentials.json
+token.json
+pac_memory.json
+pac_timetable.json
+pac_contacts.json
+pac_faces/
+pac_received/
+dist/
+build/
+log.txt
+nuitka-crash-report.xml
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

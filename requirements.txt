@@ -1,0 +1,20 @@
+# PAC - everything it can use. Python 3.12 supports all of it; newer Pythons may lack mediapipe (gestures).
+# --- core (the app starts without the optional ones, but features switch off)
+SpeechRecognition      # voice mode (listening)
+sounddevice            # microphone input, clap detection (PyAudio is NOT needed)
+numpy                  # audio + camera maths
+pyttsx3                # talk-back voice that works offline
+edge-tts               # natural neural voice (needs internet)
+pyautogui              # mouse / keyboard control, screenshots
+pillow                 # screenshots and images
+psutil                 # battery, CPU, system info
+# --- augmented reality + face security + gestures
+opencv-python          # camera, AR objects, face recognition
+mediapipe              # hand gestures (downloads its hand model on first use, needs internet once)
+# --- extras
+sympy                  # exact algebra in the maths commands
+segno                  # QR codes
+keyring                # keeps Gmail / Claude keys in the Windows credential store
+# --- building the downloadable app
+nuitka
+zstandard              # lets Nuitka compress with less memory
