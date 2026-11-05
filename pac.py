@@ -12649,17 +12649,29 @@ class ARVision:
 
 
 class Orb:
-    """The voice display: a blue wireframe sphere whose surface ripples and swells with the sound,
-    ringed by drifting specks. Pure tkinter canvas drawing - no extra packages."""
+    """State-reactive 3D wireframe sphere with outer orbital reticle & radial audio spectrum."""
 
     NL, NP = 13, 36      # latitude rings, points per ring
     NM, NQ = 20, 28      # meridians, points per meridian
 
+    PALETTES = {
+        "idle":        ("#0B2545", "#38BDF8"),
+        "hearing":     ("#064E3B", "#34D399"),
+        "speaking":    ("#2E1065", "#A78BFA"),
+        "recognizing": ("#451A03", "#FBBF24"),
+        "asleep":      ("#0F172A", "#475569"),
+    }
+
     def __init__(self, bg, deep, bright):
         self.t = 0.0
         self.rot = 0.0
-        self.bg, self.deep = bg, deep
-        self.shades = [mix(deep, bright, i / 7.0) for i in range(8)]
+        self.bg, self.deep, self.bright = bg, deep, bright
+        self.state = "idle"
+        self.palettes = {
+            k: (d, b, [mix(d, b, i / 7.0) for i in range(8)])
+            for k, (d, b) in self.PALETTES.items()
+        }
+        self.shades = self.palettes["idle"][2]
         two_pi = 2 * math.pi
         self.rings = []
         for i in range(1, self.NL + 1):
@@ -12680,6 +12692,11 @@ class Orb:
             r = math.sqrt(1 - z * z)
             self.dust.append((r * math.cos(a), z, r * math.sin(a), rnd.uniform(1.1, 1.6), rnd.random()))
 
+    def set_state(self, state):
+        if state in self.palettes:
+            self.state = state
+            self.deep, self.bright, self.shades = self.palettes[state]
+
     def draw(self, cv, cx, cy, R, level, dt):
         self.t += dt * (0.7 + 2.4 * level)
         self.rot += dt * 0.32
@@ -12692,10 +12709,51 @@ class Orb:
         shades = self.shades
         buckets = [[] for _ in shades]
 
-        for scale, a in ((1.38, 0.05), (1.24, 0.09), (1.12, 0.14)):          # soft halo
+        for scale, a in ((1.52, 0.05), (1.34, 0.10), (1.16, 0.18)):          # soft arc-reactor halo
             g = R * scale * (1 + 0.05 * level)
             cv.create_oval(cx - g, cy - g, cx + g, cy + g, outline="",
-                           fill=mix(self.bg, self.deep, min(1.0, a + 0.3 * level)))
+                           fill=mix(self.bg, self.deep, min(1.0, a + 0.32 * level)))
+
+        # Concentric Counter-Rotating Holographic Rings
+        r_outer = R * 1.46
+        cv.create_oval(cx - r_outer, cy - r_outer, cx + r_outer, cy + r_outer,
+                       outline=shades[2], width=1)
+        # Degree ticks around outer ring
+        for deg_i in range(36):
+            ang = (2 * math.pi * deg_i / 36) - self.rot * 0.25
+            major = (deg_i % 3 == 0)
+            r0 = r_outer - (6 if major else 3)
+            r1 = r_outer + (2 if major else 0)
+            cv.create_line(cx + cos(ang) * r0, cy + sin(ang) * r0,
+                           cx + cos(ang) * r1, cy + sin(ang) * r1,
+                           fill=shades[5 if major else 2], width=2 if major else 1)
+
+        # Segmented counter-rotating tactical arcs
+        r_arc1 = R * 1.35
+        deg_base1 = (self.rot * 42.0) % 360
+        for start_off, extent in ((0, 58), (90, 42), (180, 58), (270, 42)):
+            cv.create_arc(cx - r_arc1, cy - r_arc1, cx + r_arc1, cy + r_arc1,
+                          start=deg_base1 + start_off, extent=extent,
+                          style="arc", outline=shades[6], width=2)
+
+        r_arc2 = R * 1.25
+        deg_base2 = (-self.rot * 65.0) % 360
+        for start_off, extent in ((20, 70), (140, 70), (260, 70)):
+            cv.create_arc(cx - r_arc2, cy - r_arc2, cx + r_arc2, cy + r_arc2,
+                          start=deg_base2 + start_off, extent=extent,
+                          style="arc", outline=shades[4], width=2)
+
+        # Radial Audio Equalizer Spikes
+        nbars = 32
+        for bi in range(nbars):
+            ang = (2 * math.pi * bi / nbars) + self.rot * 0.4
+            wave = abs(sin(ang * 3.0 + t * 3.2)) * (0.18 + 0.82 * level)
+            r0 = R * 1.12
+            r1 = r0 + R * (0.04 + 0.18 * wave)
+            x0, y0 = cx + cos(ang) * r0, cy + sin(ang) * r0
+            x1, y1 = cx + cos(ang) * r1, cy + sin(ang) * r1
+            col_idx = min(7, int(2 + 5 * wave))
+            cv.create_line(x0, y0, x1, y1, fill=shades[col_idx], width=2)
 
         def emit(line):
             run, cur, first = [], 0, True
@@ -12752,13 +12810,18 @@ LANGS = [("en-IN", "English (India)"), ("en-US", "English (US)"),
 
 
 class PacApp:
-    # Strictly black and blue: pure black is the canvas, every other tone is a blue. (The RED_* names are kept from the old red theme.)
-    BG = "#000000"
-    RED = "#1a8cff"          # accents, active menu rows, the recorder at full volume
-    RED_TEXT = "#45a5ff"     # text you read
-    RED_MID = "#1670c8"
-    RED_DIM = "#14518c"      # secondary text
-    RED_DEEP = "#07264a"     # hairlines and the quietest bars
+    # Deep Obsidian Slate & Cyber-Cyan HUD theme (RED_* attribute names preserved for dialog compatibility)
+    BG = "#050914"           # deep obsidian canvas
+    SURFACE = "#0B1326"      # elevated card / panel surface
+    SURFACE_ALT = "#101C36"  # chip / input surface
+    RED = "#38BDF8"          # electric sky cyan accent
+    RED_TEXT = "#E2F1FF"     # crisp high-contrast ice-white text
+    RED_MID = "#0EA5E9"      # mid cyan accent
+    RED_DIM = "#6488B4"      # legible slate-blue secondary text
+    RED_DEEP = "#182C4E"     # subtle HUD border / hairline
+    GREEN = "#34D399"        # active / listening emerald
+    VIOLET = "#A78BFA"       # speaking / AI brain violet
+    AMBER = "#FBBF24"        # processing amber
 
     def __init__(self, root):
         import tkinter as tk
@@ -12767,8 +12830,8 @@ class PacApp:
         self.root = root
         fams = set(tkfont.families(root))
         pick = lambda *names: next((n for n in names if n in fams), names[-1])
-        self.F = pick("Bahnschrift", "Segoe UI", "Helvetica Neue", "DejaVu Sans", "Helvetica")
-        self.FM = pick("Consolas", "Menlo", "DejaVu Sans Mono", "Courier")
+        self.F = pick("Segoe UI Variable Display", "Segoe UI", "Bahnschrift", "Helvetica Neue", "Helvetica")
+        self.FM = pick("Cascadia Mono", "Consolas", "Menlo", "DejaVu Sans Mono", "Courier")
         self.cfg = load_config()
         install_knowledge_pack(self.cfg)
         self.ui_q = queue.Queue()
@@ -12779,11 +12842,14 @@ class PacApp:
         self.level_target = 0.0     # written by the Listener thread
         self.level_time = 0.0
         self.level_shown = 0.0
-        self.orb = Orb(self.BG, self.RED_DEEP, self.RED_TEXT)
+        self.orb = Orb(self.BG, self.RED_DEEP, self.RED)
         self.last_frame = time.time()
         self.pulse = 0.0                     # brief flash of the orb when a clap / whistle is heard
         self.trigger_mic_failed = False
         self.heard_text, self.heard_until = "", 0.0
+        self._sys_metrics = ("CPU --%", "RAM --%", "BAT --%")
+        self._sys_metrics_at = 0.0
+        self.pills = {}
         self.speaker = Speaker(self.cfg, on_info=lambda s: self.ui("log", "sys", s))
         self.speaker.on_voice = lambda code: self.ui("voice_changed", code)
         self.assistant = Assistant(self.cfg, self.speaker.say, lambda w, t: self.ui("log", w, t),
@@ -12915,10 +12981,10 @@ class PacApp:
     # ----- layout
     def build_ui(self):
         tk, r = self.tk, self.root
-        r.title("PAC")
+        r.title("PAC — Personal AI & Vision Assistant")
         sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
-        r.geometry(f"{min(780, sw - 60)}x{min(740, sh - 90)}")
-        r.minsize(520, 440)
+        r.geometry(f"{min(860, sw - 60)}x{min(800, sh - 80)}")
+        r.minsize(620, 520)
         r.configure(bg=self.BG)
         make_icon(ICON_FILE)
         try:
@@ -12926,62 +12992,125 @@ class PacApp:
         except Exception:
             pass
 
-        # top bar: the name on the left, the one menu that holds every feature on the right
-        top = tk.Frame(r, bg=self.BG)
-        top.pack(fill="x", padx=20, pady=(16, 0))
-        tk.Label(top, text="PAC", font=(self.F, 24, "bold"), fg=self.RED, bg=self.BG).pack(side="left")
-        self.menu_btn = tk.Menubutton(top, text="Menu  \u25be", font=(self.F, 11, "bold"), bg=self.RED,
+        # --- Top Header Card ---
+        top_card = tk.Frame(r, bg=self.SURFACE, highlightthickness=1, highlightbackground=self.RED_DEEP)
+        top_card.pack(fill="x", padx=18, pady=(14, 0))
+        top = tk.Frame(top_card, bg=self.SURFACE)
+        top.pack(fill="x", padx=16, pady=10)
+
+        brand = tk.Frame(top, bg=self.SURFACE)
+        brand.pack(side="left")
+        tk.Label(brand, text="PAC", font=(self.F, 22, "bold"), fg=self.RED, bg=self.SURFACE).pack(side="left")
+        tk.Label(brand, text="  AI  \u2022  VOICE  \u2022  VISION HUD", font=(self.FM, 9, "bold"),
+                 fg=self.RED_DIM, bg=self.SURFACE).pack(side="left", padx=(6, 0), pady=(6, 0))
+
+        self.menu_btn = tk.Menubutton(top, text="\u2630  Menu  \u25be", font=(self.F, 10, "bold"), bg=self.RED,
                                       fg=self.BG, activebackground=self.RED_TEXT, activeforeground=self.BG,
-                                      relief="flat", bd=0, padx=18, pady=7, cursor="hand2", direction="below")
+                                      relief="flat", bd=0, padx=16, pady=6, cursor="hand2", direction="below")
         self.menu_btn.pack(side="right")
+
+        self.sys_lbl = tk.Label(top, text="CPU --%  |  RAM --%", font=(self.FM, 9),
+                                fg=self.RED_DIM, bg=self.SURFACE_ALT, padx=10, pady=4,
+                                highlightthickness=1, highlightbackground=self.RED_DEEP)
+        self.sys_lbl.pack(side="right", padx=(0, 10))
         self.build_menu()
 
+        # --- Status & Mode Strip ---
         strip = tk.Frame(r, bg=self.BG)
-        strip.pack(fill="x", padx=20, pady=(10, 0))
-        self.badge = tk.Label(strip, font=(self.F, 9, "bold"), padx=9, pady=2, bd=0, highlightthickness=1)
+        strip.pack(fill="x", padx=20, pady=(8, 0))
+        self.badge = tk.Label(strip, font=(self.F, 9, "bold"), padx=10, pady=3, bd=0, highlightthickness=1)
         self.badge.pack(side="left")
-        self.status = tk.Label(strip, font=(self.F, 10), fg=self.RED_DIM, bg=self.BG, anchor="w")
+        self.status = tk.Label(strip, font=(self.F, 10), fg=self.RED_TEXT, bg=self.BG, anchor="w")
         self.status.pack(side="left", padx=12)
 
-        # the voice orb: a blue wireframe sphere that ripples and swells with your voice
-        self.cv = tk.Canvas(r, height=max(200, min(290, int(sh * 0.30))), bg=self.BG, highlightthickness=0, bd=0)
-        self.cv.pack(fill="x", padx=20, pady=(6, 0))
-        self.live = tk.Label(r, text="", font=(self.F, 10, "italic"), fg=self.RED_DIM, bg=self.BG,
-                             anchor="w", justify="left")
-        self.live.pack(fill="x", padx=22, pady=(6, 0))
+        # --- 3D Voice & State Orb HUD Canvas ---
+        orb_wrap = tk.Frame(r, bg=self.BG)
+        orb_wrap.pack(fill="x", padx=18, pady=(6, 0))
+        self.cv = tk.Canvas(orb_wrap, height=max(195, min(260, int(sh * 0.27))), bg=self.BG,
+                            highlightthickness=1, highlightbackground=self.RED_DEEP, bd=0)
+        self.cv.pack(fill="x")
 
-        # footer, then the entry row: both packed before the chat so they can never be squeezed off a small screen
-        self.footer = tk.Label(r, text=FOOTER_TEXT, font=(self.F, 9), fg=self.RED_DIM, bg=self.BG)
-        self.footer.pack(side="bottom", pady=(0, 10))
-        row = tk.Frame(r, bg=self.BG)
-        row.pack(side="bottom", fill="x", padx=20, pady=(0, 6))
-        tk.Label(row, text=">", font=(self.FM, 14, "bold"), fg=self.RED, bg=self.BG).pack(side="left", padx=(0, 8))
-        self.entry = tk.Entry(row, font=(self.F, 12), bg=self.BG, fg=self.RED_TEXT, insertbackground=self.RED,
-                              relief="flat", bd=0, highlightthickness=1, highlightbackground=self.RED_DEEP,
-                              highlightcolor=self.RED, selectbackground=self.RED, selectforeground=self.BG)
-        self.entry.pack(side="left", fill="x", expand=True, ipady=9, padx=(0, 10))
+        # --- One-Click Subsystem Toggle Pills ---
+        dock = tk.Frame(r, bg=self.BG)
+        dock.pack(fill="x", padx=18, pady=(6, 0))
+
+        def make_pill(key, label, cmd):
+            b = tk.Button(dock, text=label, command=cmd, font=(self.F, 9, "bold"),
+                          bg=self.SURFACE, fg=self.RED_DIM, activebackground=self.RED,
+                          activeforeground=self.BG, relief="flat", bd=0, padx=9, pady=4,
+                          cursor="hand2", highlightthickness=1, highlightbackground=self.RED_DEEP)
+            b.pack(side="left", padx=(0, 5))
+            self.pills[key] = b
+
+        make_pill("mode", "Voice Mode", lambda: self.set_mode("text" if self.mode == "voice" else "voice"))
+        make_pill("mic", "Mic", lambda: (self.mic_var.set(not self.mic_var.get()), self.toggle_mic()))
+        make_pill("clap", "Clap Wake", lambda: (self.trig_var.set(not self.trig_var.get()), self.toggle_triggers()))
+        make_pill("gest", "Gestures", lambda: self.set_gestures(not self.gest_var.get()))
+        make_pill("air", "Air Drag", lambda: self.set_air_drag(not self.airdrag_var.get()))
+        make_pill("face", "Face ID", lambda: self.set_faces(not self.face_var.get()))
+        make_pill("ar", "AR Vision", lambda: self.set_ar(not self.ar_var.get()))
+        make_pill("claude", "Claude AI", lambda: (self.claude_var.set(not self.claude_var.get()), self.toggle_claude()))
+
+        self.live = tk.Label(r, text="", font=(self.F, 10, "italic"), fg=self.GREEN, bg=self.BG,
+                             anchor="w", justify="left")
+        self.live.pack(fill="x", padx=22, pady=(4, 0))
+
+        # --- Bottom Footer, Command Input Bar & Quick Prompt Chips ---
+        self.footer = tk.Label(r, text=FOOTER_TEXT + "  \u2022  MIT Licensed", font=(self.F, 9),
+                               fg=self.RED_DIM, bg=self.BG)
+        self.footer.pack(side="bottom", pady=(0, 8))
+
+        row = tk.Frame(r, bg=self.SURFACE, highlightthickness=1, highlightbackground=self.RED_DEEP)
+        row.pack(side="bottom", fill="x", padx=18, pady=(0, 6))
+        tk.Label(row, text=" \u276f ", font=(self.FM, 13, "bold"), fg=self.RED, bg=self.SURFACE).pack(side="left", padx=(6, 2))
+        self.entry = tk.Entry(row, font=(self.F, 12), bg=self.SURFACE, fg=self.RED_TEXT, insertbackground=self.RED,
+                              relief="flat", bd=0, highlightthickness=0,
+                              selectbackground=self.RED, selectforeground=self.BG)
+        self.entry.pack(side="left", fill="x", expand=True, ipady=8, padx=(2, 8))
         self.entry.bind("<Return>", lambda e: self.send_entry())
         self.entry.focus_set()
-        self.mkbtn(row, "Send", self.send_entry).pack(side="right", ipady=3)
+        self.mkbtn(row, "Send  \u21b5", self.send_entry).pack(side="right", padx=6, pady=5)
 
+        chips = tk.Frame(r, bg=self.BG)
+        chips.pack(side="bottom", fill="x", padx=18, pady=(0, 6))
+        tk.Label(chips, text="Quick:", font=(self.F, 9, "bold"), fg=self.RED_DIM, bg=self.BG).pack(side="left", padx=(0, 6))
+        for lbl, cmd in [
+            ("Schedule", lambda: self.submit("what's my schedule today")),
+            ("Battery", lambda: self.submit("battery")),
+            ("Solve x\u00b2+5x+6=0", lambda: self.submit("solve x^2 + 5x + 6 = 0")),
+            ("World News", lambda: self.submit("world news")),
+            ("Memories", lambda: self.submit("what do you remember about me")),
+            ("Hand View", self.hand_view_window),
+            ("Stop Voice", self.assistant.stop_speaking),
+            ("Clear", self.clear_chat),
+        ]:
+            cb = tk.Button(chips, text=lbl, command=cmd, font=(self.F, 9),
+                           bg=self.SURFACE_ALT, fg=self.RED_TEXT, activebackground=self.RED,
+                           activeforeground=self.BG, relief="flat", bd=0, padx=8, pady=2,
+                           cursor="hand2", highlightthickness=1, highlightbackground=self.RED_DEEP)
+            cb.pack(side="left", padx=(0, 5))
+
+        # --- Conversation Card ---
         box = tk.Frame(r, bg=self.RED_DEEP, padx=1, pady=1)
-        box.pack(fill="both", expand=True, padx=20, pady=(8, 12))
-        inner = tk.Frame(box, bg=self.BG)
+        box.pack(fill="both", expand=True, padx=18, pady=(4, 8))
+        inner = tk.Frame(box, bg=self.SURFACE)
         inner.pack(fill="both", expand=True)
-        self.chat = tk.Text(inner, wrap="word", bg=self.BG, fg=self.RED_TEXT, font=(self.F, 11), relief="flat",
-                            padx=12, pady=10, state="disabled", cursor="arrow", spacing3=6, bd=0,
+        self.chat = tk.Text(inner, wrap="word", bg=self.SURFACE, fg=self.RED_TEXT, font=(self.F, 11), relief="flat",
+                            padx=14, pady=10, state="disabled", cursor="arrow", spacing1=3, spacing3=7, bd=0,
                             highlightthickness=0, selectbackground=self.RED, selectforeground=self.BG)
-        sb = tk.Scrollbar(inner, command=self.chat.yview, bg=self.RED_DEEP, troughcolor=self.BG,
+        sb = tk.Scrollbar(inner, command=self.chat.yview, bg=self.RED_DEEP, troughcolor=self.SURFACE,
                           activebackground=self.RED, relief="flat", bd=0, width=10)
         self.chat.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.chat.pack(side="left", fill="both", expand=True)
-        self.chat.tag_config("you_label", foreground=self.RED, font=(self.F, 10, "bold"))
-        self.chat.tag_config("pac_label", foreground=self.RED_MID, font=(self.F, 10, "bold"))
-        self.chat.tag_config("you", foreground=self.RED_TEXT)
-        self.chat.tag_config("pac", foreground=self.RED)
-        self.chat.tag_config("sys", foreground=self.RED_DIM, font=(self.F, 10, "italic"))
-        self.chat.tag_config("list", foreground=self.RED_TEXT, font=(self.FM, 11), lmargin1=12, lmargin2=12)
+        self.chat.tag_config("time_tag", foreground=self.RED_DIM, font=(self.FM, 9))
+        self.chat.tag_config("you_label", foreground=self.GREEN, font=(self.F, 10, "bold"))
+        self.chat.tag_config("pac_label", foreground=self.RED, font=(self.F, 10, "bold"))
+        self.chat.tag_config("sys_label", foreground=self.AMBER, font=(self.F, 9, "bold"))
+        self.chat.tag_config("you", foreground=self.RED_TEXT, lmargin1=8, lmargin2=18)
+        self.chat.tag_config("pac", foreground="#BAE6FD", lmargin1=8, lmargin2=18)
+        self.chat.tag_config("sys", foreground=self.RED_DIM, font=(self.F, 10, "italic"), lmargin1=8, lmargin2=18)
+        self.chat.tag_config("list", foreground=self.RED_TEXT, font=(self.FM, 10), lmargin1=16, lmargin2=16)
 
         r.protocol("WM_DELETE_WINDOW", self.on_close)
         r.bind("<Escape>", lambda e: self.assistant.stop_speaking())
@@ -14711,43 +14840,114 @@ class PacApp:
         if w < 60 or h < 60:
             return
         cv.delete("all")
-        self.orb.draw(cv, w / 2, h / 2 + 10, min(h * 0.33, w * 0.28), self.level_shown, dt)
         st = self.listener.state()
         hearing = st == "hearing" and not self.assistant.asleep
+        if self.assistant.asleep or (self.mode == "voice" and not self.mic_on):
+            orb_state, state_col = "asleep", self.RED_DIM
+        elif self.speaker.busy():
+            orb_state, state_col = "speaking", self.VIOLET
+        elif hearing:
+            orb_state, state_col = "hearing", self.GREEN
+        elif st == "recognizing":
+            orb_state, state_col = "recognizing", self.AMBER
+        else:
+            orb_state, state_col = "idle", self.RED
+        self.orb.set_state(orb_state)
+
+        # Corner HUD Reticle Brackets
+        b_len = 16
+        for (bx, by, dx, dy) in ((10, 10, 1, 1), (w - 10, 10, -1, 1), (10, h - 10, 1, -1), (w - 10, h - 10, -1, -1)):
+            cv.create_line(bx, by, bx + dx * b_len, by, fill=self.RED_DEEP, width=2)
+            cv.create_line(bx, by, bx, by + dy * b_len, fill=self.RED_DEEP, width=2)
+
+        self.orb.draw(cv, w / 2, h / 2 + 6, min(h * 0.31, w * 0.25), self.level_shown, dt)
+
         dot = False
         if self.mode == "text":
-            left = "Text mode"
-            right = "Listening for claps and whistles" if self.capture_wanted() else "Microphone closed"
+            left = "TEXT HUD"
+            right = "CLAP / WHISTLE ARMED" if self.capture_wanted() else "MIC CLOSED"
         elif not self.mic_on:
-            left, right = "Microphone off", ""
+            left, right = "MIC MUTED", "OFFLINE"
         elif self.assistant.asleep:
-            left, right = "Asleep", f"Boost {float(self.cfg.get('gain', 2.0)):.1f}x"
+            left, right = "SLEEPING", f"GAIN {float(self.cfg.get('gain', 2.0)):.1f}x"
+        elif self.speaker.busy():
+            left, right = "SPEAKING", f"VOICE {self.speaker.rate} WPM"
         elif hearing:
             el = max(0, int(time.time() - self.listener.rec_started))
             left, dot = f"REC  {el // 60:02d}:{el % 60:02d}", int(time.time() * 2) % 2 == 0
-            right = f"Boost {float(self.cfg.get('gain', 2.0)):.1f}x"
+            right = f"GAIN {float(self.cfg.get('gain', 2.0)):.1f}x"
         else:
-            left = "Processing" if st == "recognizing" else "Standby"
-            right = f"Boost {float(self.cfg.get('gain', 2.0)):.1f}x"
+            left = "PROCESSING..." if st == "recognizing" else "STANDBY  \u2022  LISTENING"
+            right = f"GAIN {float(self.cfg.get('gain', 2.0)):.1f}x"
         if self.gesture.running:
-            right = ("Gestures on   " + right).strip()
-        x0 = 16
-        if hearing:
-            if dot:
-                cv.create_oval(16, 9, 26, 19, fill=self.RED, outline="")
-            x0 = 34
-        cv.create_text(x0, 14, text=left, anchor="w", fill=self.RED if hearing else self.RED_TEXT,
-                       font=(self.FM, 10, "bold"))
-        cv.create_text(w - 16, 14, text=right, anchor="e", fill=self.RED_DIM, font=(self.FM, 9))
+            right = ("HAND TRACKING   |   " + right).strip()
+
+        x0 = 22
+        if hearing and dot:
+            cv.create_oval(22, 13, 32, 23, fill=self.GREEN, outline="")
+            x0 = 38
+        cv.create_text(x0, 18, text=left, anchor="w", fill=state_col, font=(self.FM, 10, "bold"))
+        cv.create_text(w - 22, 18, text=right, anchor="e", fill=self.RED_DIM, font=(self.FM, 9))
+
+        # Left & Right Holographic Side HUD Panels
+        if w >= 560:
+            cpu_v, ram_v, bat_v = getattr(self, "_sys_vals", (14, 46, 92))
+            # Left Panel: Core Telemetry Bars
+            lx = 22
+            cv.create_text(lx, 52, text="PAC.TELEMETRY // LIVE", anchor="w", fill=self.RED_DIM, font=(self.FM, 8, "bold"))
+            cv.create_line(lx, 62, lx + 148, 62, fill=self.RED_DEEP, width=1)
+            for idx_m, (m_lbl, m_val, m_col) in enumerate((
+                ("SYS.CPU", cpu_v, self.RED),
+                ("SYS.MEM", ram_v, self.RED_MID),
+                ("PWR.CELL", bat_v, self.GREEN),
+                ("AUD.LVL", int(min(100, self.level_shown * 100)), state_col),
+            )):
+                my = 76 + idx_m * 32
+                cv.create_text(lx, my, text=m_lbl, anchor="w", fill=self.RED_DIM, font=(self.FM, 8))
+                cv.create_text(lx + 148, my, text=f"{m_val:02d}%", anchor="e", fill=self.RED_TEXT, font=(self.FM, 8, "bold"))
+                cv.create_rectangle(lx, my + 9, lx + 148, my + 14, fill=self.SURFACE_ALT, outline="")
+                cv.create_rectangle(lx, my + 9, lx + int(1.48 * max(2, min(100, m_val))), my + 14, fill=m_col, outline="")
+
+            # Right Panel: Subsystem Matrix
+            rx = w - 22
+            cv.create_text(rx, 52, text="SUBSYSTEM.MATRIX // STATUS", anchor="e", fill=self.RED_DIM, font=(self.FM, 8, "bold"))
+            cv.create_line(rx - 156, 62, rx, 62, fill=self.RED_DEEP, width=1)
+            matrix = (
+                ("VOICE.LINK", "ONLINE" if (self.mode == "voice" and self.mic_on) else "TEXT", self.mode == "voice" and self.mic_on),
+                ("ACOUSTIC.TRIG", "ARMED" if self.cfg.get("sound_triggers", True) else "OFF", bool(self.cfg.get("sound_triggers", True))),
+                ("HAND.TRACK", "ACTIVE" if self.gesture.running else "STANDBY", bool(self.gesture.running)),
+                ("BIOMETRIC.ID", "LOCKED" if self.faces.running else "STANDBY", bool(self.faces.running)),
+                ("OPTIC.AR", "ONLINE" if self.ar.running else "STANDBY", bool(self.ar.running)),
+            )
+            for idx_s, (s_lbl, s_st, s_on) in enumerate(matrix):
+                sy = 78 + idx_s * 26
+                scol = self.GREEN if s_on else self.RED_DIM
+                cv.create_text(rx - 156, sy, text=s_lbl, anchor="w", fill=self.RED_DIM, font=(self.FM, 8))
+                cv.create_text(rx, sy, text=f"[{s_st}]", anchor="e", fill=scol, font=(self.FM, 8, "bold"))
+
+        # Bottom Audio Level Meter Bar inside Orb Canvas
+        meter_w = min(260, w - 80)
+        mx0 = (w - meter_w) / 2
+        my0 = h - 14
+        cv.create_rectangle(mx0, my0, mx0 + meter_w, my0 + 4, fill=self.SURFACE_ALT, outline="")
+        if self.level_shown > 0.01:
+            fill_w = meter_w * min(1.0, self.level_shown)
+            cv.create_rectangle(mx0, my0, mx0 + fill_w, my0 + 4, fill=state_col, outline="")
 
     # ----- window plumbing
     def append(self, who, text):
         c = self.chat
         c.configure(state="normal")
+        ts = datetime.datetime.now().strftime("%H:%M")
         if who == "you":
-            c.insert("end", "You   ", "you_label")
+            c.insert("end", f"[{ts}] ", "time_tag")
+            c.insert("end", "YOU   ", "you_label")
         elif who == "pac":
+            c.insert("end", f"[{ts}] ", "time_tag")
             c.insert("end", "PAC   ", "pac_label")
+        elif who != "list":
+            c.insert("end", f"[{ts}] ", "time_tag")
+            c.insert("end", "SYS   ", "sys_label")
         start = c.index("end-1c")
         c.insert("end", text + "\n", who if who in ("you", "pac", "list") else "sys")
         c.configure(state="disabled")
@@ -14758,42 +14958,85 @@ class PacApp:
     def refresh_badge(self):
         claude = getattr(self.assistant, "claude_on", False)
         if self.mode == "voice":
-            self.badge.configure(text="Voice mode, Google speech" + (" + Claude" if claude else ""),
+            self.badge.configure(text="\u25cf  VOICE MODE" + ("  +  CLAUDE AI" if claude else "  \u2022  LIVE SPEECH"),
                                  bg=self.RED, fg=self.BG, highlightbackground=self.RED)
         elif claude:
-            self.badge.configure(text="Text mode + Claude (online)", bg=self.RED, fg=self.BG,
-                                 highlightbackground=self.RED)
+            self.badge.configure(text="\u25cf  TEXT MODE  +  CLAUDE AI", bg=self.VIOLET, fg=self.BG,
+                                 highlightbackground=self.VIOLET)
         else:
-            self.badge.configure(text="Text mode, offline" if not self.cfg.get("background_search", True)
-                                 else "Text mode, quiet web lookups", bg=self.BG, fg=self.RED,
-                                 highlightbackground=self.RED)
+            self.badge.configure(text="\u25cb  TEXT MODE  \u2022  OFFLINE" if not self.cfg.get("background_search", True)
+                                 else "\u25cf  TEXT MODE  \u2022  WEB SMART LOOKUP",
+                                 bg=self.SURFACE_ALT, fg=self.RED, highlightbackground=self.RED)
+
+    def _update_pills(self):
+        if not getattr(self, "pills", None):
+            return
+        states = {
+            "mode":   (self.mode == "voice", f"\u25cf Voice" if self.mode == "voice" else "\u25cb Text"),
+            "mic":    (self.mic_on, f"\u25cf Mic" if self.mic_on else "\u25cb Mic Off"),
+            "clap":   (bool(self.cfg.get("sound_triggers", True)), "\u25cf Clap Wake" if self.cfg.get("sound_triggers", True) else "\u25cb Clap Wake"),
+            "gest":   (bool(self.gesture.running or self.gest_var.get()), "\u25cf Gestures" if (self.gesture.running or self.gest_var.get()) else "\u25cb Gestures"),
+            "air":    (bool(self.airdrag_var.get()), "\u25cf Air Drag" if self.airdrag_var.get() else "\u25cb Air Drag"),
+            "face":   (bool(self.faces.running or self.face_var.get()), "\u25cf Face ID" if (self.faces.running or self.face_var.get()) else "\u25cb Face ID"),
+            "ar":     (bool(self.ar.running or self.ar_var.get()), "\u25cf AR Vision" if (self.ar.running or self.ar_var.get()) else "\u25cb AR Vision"),
+            "claude": (bool(getattr(self.assistant, "claude_on", False)), "\u25cf Claude AI" if getattr(self.assistant, "claude_on", False) else "\u25cb Claude AI"),
+        }
+        for key, (on, txt) in states.items():
+            btn = self.pills.get(key)
+            if btn:
+                fg = self.GREEN if (on and key in ("mic", "gest", "face", "ar")) else (self.RED if on else self.RED_DIM)
+                bg = self.SURFACE_ALT if on else self.SURFACE
+                bdr = fg if on else self.RED_DEEP
+                if btn.cget("text") != txt or btn.cget("fg") != fg:
+                    btn.configure(text=txt, fg=fg, bg=bg, highlightbackground=bdr)
+
+    def _update_sys_telemetry(self):
+        now = time.time()
+        if now - self._sys_metrics_at < 3.0:
+            return
+        self._sys_metrics_at = now
+        try:
+            if psutil is not None:
+                cpu = int(psutil.cpu_percent(interval=None))
+                ram = int(psutil.virtual_memory().percent)
+                bat_obj = psutil.sensors_battery()
+                bat_pct = int(bat_obj.percent) if bat_obj else 100
+                self._sys_vals = (cpu, ram, bat_pct)
+                bat = f"  |  BAT {bat_pct}%" if bat_obj else ""
+                self.sys_lbl.configure(text=f"CPU {cpu}%  |  RAM {ram}%{bat}")
+            else:
+                self.sys_lbl.configure(text=datetime.datetime.now().strftime("%a %d %b  \u2022  %I:%M %p"))
+        except Exception:
+            pass
 
     def refresh_status(self):
         a = self.assistant
         st = self.listener.state()
         if self.mode == "text":
-            txt, col = ("Type a command below" + ("  |  listening for claps and whistles" if self.capture_wanted() else "")), self.RED_TEXT
+            txt, col = ("Ready for text commands" + ("  \u2022  Clap/Whistle wake active" if self.capture_wanted() else "")), self.RED_TEXT
         elif not self.mic_on:
-            txt, col = "Microphone is off", self.RED_DIM
+            txt, col = "Microphone is muted", self.RED_DIM
         elif a.asleep:
-            txt, col = "Sleeping - say 'wake up'", self.RED_DIM
+            txt, col = "Sleeping \u2014 say 'wake up' or double-clap", self.RED_DIM
         elif self.speaker.busy():
-            txt, col = "Speaking...", self.RED
+            txt, col = "PAC is speaking...", self.VIOLET
         elif a.dictating:
-            txt, col = "Dictation on - say 'stop typing' when done", self.RED_MID
+            txt, col = "Dictation active \u2014 say 'stop typing' when done", self.RED_MID
         elif st == "hearing":
-            txt, col = "Hearing you...", self.RED
+            txt, col = "Listening to your voice...", self.GREEN
         elif st == "recognizing":
-            txt, col = "Recognizing...", self.RED_TEXT
+            txt, col = "Recognizing speech...", self.AMBER
         else:
-            txt, col = "Listening...", self.RED_TEXT
+            txt, col = "Online & listening...", self.RED_TEXT
         if self.gesture.running:
-            txt += "  |  gestures on"
+            txt += "  \u2022  Hand gestures active"
         self.status.configure(text=txt, fg=col)
+        self._update_pills()
+        self._update_sys_telemetry()
         if st == "recognizing":
-            live = "Recognizing..."
+            live = "\u2728 Recognizing speech..."
         elif time.time() < self.heard_until:
-            live = f'Heard: "{self.heard_text}"'
+            live = f'\ud83c\udf99 Heard: "{self.heard_text}"'
         else:
             live = ""
         if self.live.cget("text") != live:
