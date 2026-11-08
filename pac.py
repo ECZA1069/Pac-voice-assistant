@@ -51,7 +51,7 @@ PAC - your personal voice assistant (Windows first; macOS/Linux mostly work)
   chosen, PAC behaves exactly as before. Confirmations and face locks still apply to everything the AI triggers.
 
 * Long-term memory (Menu > Memory): PAC remembers what you tell it about yourself - preferences ("I prefer tea"),
-  routines ("every morning I walk"), people ("my wife is Priya"), contacts ("mom's number is 98765 43210") - in
+  routines ("every morning I walk"), people ("my wife is Priya"), contacts (saved by you, with no predefined numbers) - in
   ~/.pac/memory.json on this laptop, and uses the few that fit each request: they personalise the AI brain's and Claude's
   answers, answer "where do I live" offline, and make "message my wife" work. It improves with use: repeating a thing
   strengthens it, a newer statement replaces an older one, and a command you repeat at the same time of day on three
@@ -129,6 +129,7 @@ DATA_DIR = HOME / ".pac"
 DATA_DIR.mkdir(exist_ok=True)
 CONFIG_FILE = DATA_DIR / "config.json"
 LOG_FILE = DATA_DIR / "pac.log"
+WA_REPLIED_FILE = DATA_DIR / "wa_replied_ids.json"
 ICON_FILE = DATA_DIR / "pac_blue.ico"
 NOTES_FILE = HOME / "pac_notes.txt"
 KNOWLEDGE_DIR = DATA_DIR / "knowledge"
@@ -152,7 +153,7 @@ DEFAULT_MESSAGES = [
 ]
 DEFAULT_CONFIG = {
     "country_code": "91",     # added to 10-digit phone numbers
-    "contacts": {},           # {"mom": "9876543210"}
+    "contacts": {},           # user-saved contacts only (no predefined numbers)
     "messages": DEFAULT_MESSAGES,
     "mic": None,              # microphone device index (None = system default)
     "gain": 2.0,              # software mic boost (auto-adjusted unless you move the slider)
@@ -160,7 +161,8 @@ DEFAULT_CONFIG = {
     "rate": 165,              # speaking speed
     "voice_idx": 0,           # which of the female voices found
     "wa_delay": 7,            # seconds to wait for WhatsApp before pressing Enter
-    "confirm_send": True,     # ask "shall I send it?" before sending WhatsApp messages
+    "confirm_send": True,     # ask "shall I send it?" before sending manual WhatsApp messages
+    "wa_auto_reply": True,    # background watcher that automatically reads incoming WhatsApp messages and replies back accordingly
     "online_fallback": "ask", # only used when background_search is off: "ask" = ask before Google, "yes" = just open it, "no" = never
     "background_search": True, # a question with no offline answer is searched on the web quietly: no question, no browser window
     "search_engine": "google", # "google" = Google through a hidden Chrome/Edge (DuckDuckGo if it refuses), "duckduckgo" = DuckDuckGo only
@@ -171,12 +173,19 @@ DEFAULT_CONFIG = {
     "mail_count": 10,         # how many mails to list at a time
     "claude_model": "claude-haiku-4-5-20251001",   # used only when you switch Claude mode on / ask Claude
     "claude_api_key": "",     # only used if 'keyring' isn't installed; Claude mode itself is never remembered
+    "gemini_model": "gemini-2.5-flash",            # Google Gemini model (gemini-2.5-flash, gemini-2.5-pro, gemini-2.0-flash)
+    "gemini_api_key": "",     # Google Gemini API key (or stored in system credential store / GEMINI_API_KEY env var)
+    "groq_model": "llama-3.3-70b-versatile",       # Free Groq AI model (llama-3.3-70b-versatile, llama-3.1-8b-instant, gemma2-9b-it)
+    "groq_api_key": "",       # Free Groq API key from console.groq.com
+    "openrouter_model": "google/gemini-2.0-flash-exp:free",  # Free OpenRouter model
+    "openrouter_api_key": "", # Free OpenRouter API key from openrouter.ai
+    "wa_ai_provider": "auto", # auto = Gemini -> Groq -> OpenRouter -> Ollama -> Claude -> Free Cloud AI
     "transfer_port": 8765,    # port for phone <-> laptop file transfer
     "transfer_max_mb": 500,   # biggest file the phone may send
     "brain": "hybrid",        # rules = built-in patterns only | hybrid = patterns first, then the AI | llm = the AI understands everything first
-    "brain_provider": "claude",  # claude (online, needs your key) or ollama (a model running on this laptop, offline)
+    "brain_provider": "ollama",  # gemini, groq, openrouter, ollama, or claude
     "ollama_url": "http://localhost:11434",
-    "ollama_model": "llama3.1:8b",   # any Ollama model that supports tools, e.g. qwen2.5:7b
+    "ollama_model": "qwen2.5:3b",   # local Ollama model (e.g. qwen2.5:3b or llama3.1:8b)
     "mode": "voice",          # "voice" = Google Web Speech (internet), "text" = typing only, fully offline
     "lang": "en-IN",          # language sent to Google\'s speech service
     "speak_replies": True,    # read replies aloud (offline text-to-speech)
@@ -2174,20 +2183,71 @@ class MailBox:
         self._api("GET", "/profile")
 
     def recent(self, unread_only=True, limit=10):
-        """(total matching, [newest first: {uid, name, addr, subject}]). Reading never marks mails as read."""
+        """(total matching, [newest first: {uid, name, addr, subject, snippet, threadId, msg_id, headers, labels, recipient_count, is_group}]). Reading never marks mails as read."""
         label = self._api("GET", "/labels/INBOX")
         total = label.get("messagesUnread" if unread_only else "messagesTotal", 0)
         found = self._api("GET", "/messages", {"labelIds": ["INBOX", "UNREAD"] if unread_only else ["INBOX"],
                                                "maxResults": limit}).get("messages", [])
         items = []
+        meta_hdrs = ["From", "To", "Cc", "Subject", "Message-ID", "References",
+                     "List-Id", "List-Unsubscribe", "List-Post", "Precedence", "Auto-Submitted",
+                     "X-Mailing-List", "X-BeenThere"]
         for m in found:
             d = self._api("GET", f"/messages/{m['id']}",
-                          {"format": "metadata", "metadataHeaders": ["From", "Subject"]})
+                          {"format": "metadata", "metadataHeaders": meta_hdrs})
             hdr = {h.get("name", "").lower(): h.get("value", "") for h in d.get("payload", {}).get("headers", [])}
             name, addr = parseaddr(hdr.get("from", ""))
-            items.append({"uid": m["id"], "name": _dh(name) or addr or "unknown sender", "addr": addr,
-                          "subject": _dh(hdr.get("subject")) or "no subject"})
+            to_raw = hdr.get("to", "")
+            cc_raw = hdr.get("cc", "")
+            recip_list = [x.strip() for x in (to_raw + "," + cc_raw).split(",") if "@" in x]
+            snippet = html.unescape(d.get("snippet", "") or "").strip()
+            item = {
+                "uid": m["id"],
+                "threadId": d.get("threadId", ""),
+                "msg_id": hdr.get("message-id", ""),
+                "references": hdr.get("references", ""),
+                "name": _dh(name) or addr or "unknown sender",
+                "addr": addr,
+                "subject": _dh(hdr.get("subject")) or "no subject",
+                "snippet": snippet,
+                "headers": hdr,
+                "labels": d.get("labelIds", []),
+                "recipient_count": max(1, len(recip_list)),
+            }
+            is_grp, grp_reason = is_gmail_group(item)
+            item["is_group"] = is_grp
+            item["group_reason"] = grp_reason
+            items.append(item)
         return total, items
+
+    def send_reply(self, item, reply_text):
+        """Send a 1-on-1 email reply in the same thread via Gmail API. Refuses group/mailing-list messages."""
+        is_grp, grp_reason = is_gmail_group(item)
+        if is_grp:
+            raise RuntimeError(f"Refused to reply to group/mailing-list email ({grp_reason}).")
+        to_addr = item.get("addr", "").strip()
+        if not to_addr or "@" not in to_addr:
+            raise RuntimeError("Cannot reply: sender email address is missing.")
+        from email.message import EmailMessage
+        msg = EmailMessage()
+        sender_me = self.cfg.get("mail_address", "").strip()
+        if sender_me:
+            msg["From"] = sender_me
+        msg["To"] = f"{item.get('name', '')} <{to_addr}>" if item.get("name") and item["name"] != to_addr else to_addr
+        subj = item.get("subject", "") or "Your email"
+        if not re.match(r"^re\s*:", subj, re.I):
+            subj = f"Re: {subj}"
+        msg["Subject"] = subj
+        if item.get("msg_id"):
+            msg["In-Reply-To"] = item["msg_id"]
+            refs = (item.get("references", "") + " " + item["msg_id"]).strip()
+            msg["References"] = refs
+        msg.set_content(reply_text)
+        raw_b64 = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii").rstrip("=")
+        body = {"raw": raw_b64}
+        if item.get("threadId"):
+            body["threadId"] = item["threadId"]
+        return self._api("POST", "/messages/send", body=body)
 
     def trash(self, ids):
         """Move mails to Trash one by one (they stay restorable). If one fails, e.done lists the ones that worked."""
@@ -2200,6 +2260,1167 @@ class MailBox:
             e.done = done
             raise
         return done
+
+
+# --------------------------------------------------------------- WhatsApp & Gmail Smart Reply + Group Filter + Sandbox
+_WA_GROUP_KEYWORDS = re.compile(
+    r"\b(?:group|team|club|community|broadcast|announcements?|family\s+group|class\s+group|official|"
+    r"committee|society|batch|squad|channel|all\s+members|study\s+group|work\s+group)\b",
+    re.I,
+)
+_GMAIL_GROUP_ADDR_RE = re.compile(
+    r"(?:no-?reply|donotreply|do-not-reply|googlegroups\.com|yahoogroups\.com|lists\.|"
+    r"newsletter|notifications?@|updates?@|broadcast@|bounce@|mailer-daemon|group)",
+    re.I,
+)
+
+
+def is_whatsapp_group(msg):
+    """Return (True, reason) if a WhatsApp message is from a group or broadcast list; (False, '') for 1-on-1 chats."""
+    if not isinstance(msg, dict):
+        return False, ""
+    if msg.get("is_group"):
+        return True, msg.get("group_reason") or "Marked as WhatsApp group chat"
+    jid = str(msg.get("jid") or msg.get("chat_id") or "").lower()
+    if jid.endswith("@g.us") or "broadcast" in jid:
+        return True, f"Group/Broadcast JID ({jid})"
+    if int(msg.get("participants", 2) or 2) > 2:
+        return True, f"Multi-participant group ({msg.get('participants')} members)"
+    title = str(msg.get("chat_title") or msg.get("sender") or "").strip()
+    if re.search(r"\d+\s+messages?\s+from\s+\d+\s+chats?", title, re.I):
+        return True, "Multi-chat summary notification"
+    if " @ " in title or (":" in title and _WA_GROUP_KEYWORDS.search(title.split(":", 1)[0])):
+        return True, f"Group sender title ({title})"
+    if _WA_GROUP_KEYWORDS.search(title):
+        return True, f"Group name detected ({title})"
+    return False, ""
+
+
+def is_gmail_group(msg):
+    """Return (True, reason) if an email is from a group, mailing list, newsletter, or multi-recipient thread."""
+    if not isinstance(msg, dict):
+        return False, ""
+    if msg.get("is_group"):
+        return True, msg.get("group_reason") or "Marked as group/mailing-list email"
+    hdr = {str(k).lower(): str(v) for k, v in (msg.get("headers") or {}).items()}
+    if hdr.get("list-id") or hdr.get("list-unsubscribe") or hdr.get("list-post") or hdr.get("x-mailing-list") or hdr.get("x-beenthere"):
+        return True, "Mailing list header (List-Id / List-Unsubscribe)"
+    prec = hdr.get("precedence", "").lower()
+    if prec in ("bulk", "list", "junk"):
+        return True, f"Bulk/List Precedence header ({prec})"
+    auto_sub = hdr.get("auto-submitted", "").lower()
+    if auto_sub and auto_sub != "no":
+        return True, f"Automated email ({auto_sub})"
+    addr = str(msg.get("addr") or "").lower()
+    if _GMAIL_GROUP_ADDR_RE.search(addr):
+        return True, f"Group/No-reply address ({addr})"
+    labels = set(msg.get("labels") or [])
+    grp_labels = labels & {"CATEGORY_PROMOTIONS", "CATEGORY_FORUMS", "CATEGORY_SOCIAL", "CATEGORY_UPDATES"}
+    if grp_labels:
+        return True, f"Gmail category ({', '.join(sorted(grp_labels))})"
+    if int(msg.get("recipient_count", 1) or 1) > 1:
+        return True, f"Multiple recipients ({msg.get('recipient_count')} people in To/Cc)"
+    subj = str(msg.get("subject") or "")
+    if re.match(r"^\[[^\]]*(?:group|list|all|team|announce)[^\]]*\]", subj, re.I):
+        return True, f"Group tag in subject ({subj[:32]})"
+    return False, ""
+
+
+def _is_pure_greeting(blob):
+    """Return True only when the message is genuinely a standalone greeting (not a longer sentence starting with hey/hi)."""
+    b = re.sub(r"[^\w\s']", " ", str(blob or "").lower()).strip()
+    words = b.split()
+    if not words or len(words) > 5:
+        return False
+    return bool(re.fullmatch(
+        r"(?:good\s+(?:morning|afternoon|evening)|gm|hello+|hey+|hi+|hh+|hlw|hlo|yo|namaste)"
+        r"(?:\s+(?:bro|brother|buddy|dude|man|sir|mam|ma'am|friend|there|appa|amma|mom|dad|papa|bhaiya|didi|anna|akka|boss|dear|all|everyone))?",
+        " ".join(words),
+    ))
+
+
+def suggest_prebuilt_replies(text, subject="", preloaded=None):
+    """Return 3 contextual prebuilt reply options based on the incoming 1-on-1 message content + user preloaded list."""
+    raw_txt = str(text or "").strip()
+    blob = f"{subject} {raw_txt}".lower().strip()
+    pre = list(preloaded or DEFAULT_MESSAGES)
+    if re.fullmatch(r"\s*\[?(?:photo|image|picture|pic)\]?\s*", raw_txt, re.I):
+        cands = [
+            "Nice photo! Thanks for sharing.",
+            "Got the photo, thank you!",
+            "Looks great! Thanks for sending.",
+        ]
+    elif re.fullmatch(r"\s*\[?(?:video|clip|reel)\]?\s*", raw_txt, re.I):
+        cands = [
+            "Got the video, thanks! I'll watch it in a moment.",
+            "Thanks for sharing the video!",
+            "I'll check out the video shortly.",
+        ]
+    elif re.fullmatch(r"\s*\[?(?:voice\s+message|audio|voice\s+note|ptt)\]?\s*", raw_txt, re.I):
+        cands = [
+            "Got your voice message, I'll listen to it and text you right back.",
+            "Just received your audio note, will listen in a moment!",
+            "I'm in a quiet spot right now, will listen to your voice note shortly.",
+        ]
+    elif re.fullmatch(r"\s*\[?(?:sticker|gif)\]?\s*", raw_txt, re.I):
+        cands = [
+            "Haha, nice one!",
+            "Got your message! How's it going?",
+            "Talk to you soon!",
+        ]
+    elif re.search(r"\b(?:see you|catch you|talk to you later|ttyl|bye|good ?bye|take care|kal milte|see ya|cya)\b", blob):
+        if "tomorrow" in blob or "kal" in blob:
+            cands = [
+                "Sounds good, see you tomorrow! Take care.",
+                "See you tomorrow!",
+                "Alright, catch you tomorrow!",
+            ]
+        else:
+            cands = [
+                "See you soon! Take care.",
+                "Alright, talk to you later!",
+                "Bye, take care!",
+            ]
+    elif re.search(r"\b(?:happy birthday|hbd|many happy returns|congratulations|congrats|happy anniversary|all the best|good luck|best wishes)\b", blob):
+        cands = [
+            "Thank you so much! Really appreciate your wishes.",
+            "Thanks a ton! Means a lot to me.",
+            "Thank you so much!",
+        ]
+    elif re.search(r"\b(?:fuck off|piss off|get lost|go away|shut up|don't text|dont text|stop messaging|leave me alone)\b", blob):
+        cands = [
+            "Alright, understood. Talk to you later.",
+            "Okay, no problem. Take care.",
+            "Got it.",
+        ]
+    elif re.search(r"\b(?:bring|buy|pick up|get some|grab some|le aana|leke aana|laana)\b", blob):
+        cands = [
+            "Sure, I'll bring it on my way back.",
+            "Got it, I'll pick that up before coming.",
+            "Noted! Will bring it with me.",
+        ]
+    elif re.search(r"\b(?:where are you|where have you reached|on your way|how far|when will you|running late|waiting for you|reached|eta|kaha ho|kahan ho|kidhar ho|coming home|come home)\b", blob):
+        cands = [
+            "I'm on my way, will be there soon.",
+            "Running a little late, please wait for me.",
+            "I'll be there in about 10 minutes.",
+        ]
+    elif re.search(r"\b(?:call me|can we talk|free to talk|quick call|phone|ring me|talk right now|pick up)\b", blob):
+        cands = [
+            "I'll call you back in a few minutes.",
+            "I'm in a meeting right now, I'll text you later.",
+            "Yes, give me 10 minutes and I'll call you.",
+        ]
+    elif re.search(r"\b(?:meeting|schedule|reschedule|tomorrow at|still on|confirm|join the|session|appointment|attend|class)\b", blob):
+        cands = [
+            "Yes, confirmed! See you then.",
+            "Confirmed, I'll be there on time.",
+            "Could we push it back by 15 minutes? I'll join right after.",
+        ]
+    elif re.search(r"\b(?:send me|send the|share the|attached|report|review|document|pdf|slides|invoice|deadline|feedback|presentation|file|assignment|notes|code|link)\b", blob):
+        cands = [
+            "Sure, I'll check and send it over to you shortly.",
+            "Received, thank you! I'll review it and get back to you shortly.",
+            "I'm working on this right now and will send an update soon.",
+        ]
+    elif re.search(r"\b(?:urgent|asap|emergency|important|immediately|right away|need help)\b", blob):
+        cands = [
+            "I just saw your message — looking into this right away and will get back to you shortly.",
+            "On it right now! Give me a few minutes.",
+            "I'll call you back in a few minutes.",
+        ]
+    elif re.search(r"\b(?:sorry|apologies|apologize|my bad|delayed)\b", blob):
+        cands = [
+            "No problem at all, take your time!",
+            "All good, don't worry about it.",
+            "Thanks for letting me know!",
+        ]
+    elif re.search(r"\b(?:dinner|lunch|breakfast|food|eat|coffee|cafe|tea|hangout|party|plans tonight)\b", blob):
+        cands = [
+            "Yes, sounds great! I'll be there soon.",
+            "I'm on my way, see you soon!",
+            "A bit tied up right now, I'll join you a little later.",
+        ]
+    elif re.search(r"\b(?:thank you|thanks|appreciate|grateful|cheers|thx|ty|shukriya|dhanyavad)\b", blob):
+        cands = [
+            "You're most welcome! Happy to help.",
+            "Thank you so much!",
+            "Anytime! Let me know if you need anything else.",
+        ]
+    elif re.search(r"\b(?:good night|gn|sweet dreams|sleep well|shubh ratri)\b", blob):
+        cands = [
+            "Good night! Take care.",
+            "Good night! See you tomorrow.",
+            "Good night!",
+        ]
+    elif re.search(r"\b(?:how are you|what's up|whats up|wassup|wsp|how's it going|hows it going|how are things|sup|kaise ho|kya haal|how r u|hru)\b", blob):
+        cands = [
+            "Hey! I'm doing well, thank you. How are you?",
+            "Doing great, thanks for asking! How are things with you?",
+            "All good here! How are you doing?",
+        ]
+    elif re.fullmatch(r"\s*(?:ok+|okay|kk+|k|done|sure|alright|fine|hmm+|hm|yes|yep|yeah|yrp|yup|cool|nice|great|got it|noted|accha|acha|theek hai|thik hai|haan|ji)\s*[.!]*\s*", blob):
+        cands = [
+            "Sounds good, thank you!",
+            "Great, talk to you soon.",
+            "Got it, thanks!",
+        ]
+    elif re.fullmatch(r"\s*(?:no|nope|nah|not now|later|leave it|never mind|nevermind|rehne do|nahi)\s*[.!]*\s*", blob):
+        cands = [
+            "Alright, no problem! Let me know whenever you're ready.",
+            "Okay, all good.",
+            "Understood, talk to you later.",
+        ]
+    elif _is_pure_greeting(blob):
+        if "good morning" in blob or re.search(r"\bgm\b", blob):
+            cands = [
+                "Good morning! Have a wonderful day.",
+                "Good morning! Hope you're having a great start to your day.",
+                "Good morning! How are you doing today?",
+            ]
+        elif "good afternoon" in blob:
+            cands = [
+                "Good afternoon! Hope your day is going well.",
+                "Good afternoon! How are things going?",
+                "Hi! Hope you're having a good afternoon.",
+            ]
+        elif "good evening" in blob:
+            cands = [
+                "Good evening! Hope you had a great day.",
+                "Good evening! How was your day?",
+                "Hey, good evening!",
+            ]
+        else:
+            cands = [
+                "Hey! I'm doing well, how are you?",
+                "Hi! Just saw your message, how's everything going?",
+                "Hey! What's up?",
+            ]
+    elif "?" in raw_txt or re.search(r"^(?:can|could|will|would|did|have|are|is|do|when|what|where|why|how|who|which)\b", raw_txt.lower()):
+        cands = [
+            "Got your question — let me check on that right away and text you back.",
+            "Let me check and get right back to you in a few minutes.",
+            "I'm checking on this now, will update you shortly.",
+        ]
+    else:
+        cands = [
+            "Got it, thanks for letting me know! I'll get back to you shortly.",
+            "Noted, thank you! Will update you soon.",
+            pre[1] if len(pre) > 1 else "I'll call you back in a few minutes.",
+        ]
+    out = []
+    for c in cands + pre:
+        if c and c not in out:
+            out.append(c)
+        if len(out) >= 3:
+            break
+    return out
+
+
+# Rolling per-sender WhatsApp conversation history so AI replies stay coherent across multiple messages
+_WA_CHAT_HISTORY = collections.defaultdict(list)
+
+
+def _clean_ai_wa_reply(ans, incoming_txt=""):
+    """Clean an LLM response into a single natural WhatsApp reply line and reject generic/broken AI phrases."""
+    if not ans:
+        return ""
+    # Strip <think>...</think> blocks if any reasoning model outputs them
+    ans = re.sub(r"<think>.*?</think>", "", str(ans), flags=re.S | re.I).strip()
+    lines = [ln.strip() for ln in ans.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    line = lines[0]
+    line = re.sub(r'^(?:reply|response|whatsapp reply|me|you)\s*:\s*', "", line, flags=re.I).strip()
+    line = re.sub(r'^["\'\u201c\u201d\u2018\u2019]+|["\'\u201c\u201d\u2018\u2019]+$', "", line).strip()
+    line = re.sub(r"[*_#`]+", "", line).strip()
+    if not line or len(line) > 260:
+        return ""
+    low = line.lower()
+    if any(bad in low for bad in (
+        "how can i assist you", "how may i help you", "as an ai", "as a language model",
+        "i am an ai", "i'm an ai", "cannot fulfill", "i don't have personal",
+    )):
+        return ""
+    # Never allow a generic "I'm doing well, how are you?" reply unless the incoming message was actually a greeting / how-are-you
+    in_low = str(incoming_txt or "").lower().strip()
+    is_greet_or_hru = _is_pure_greeting(in_low) or bool(re.search(
+        r"\b(?:how are you|how r u|hru|what's up|whats up|wassup|how's it going|kaise ho|kya haal)\b", in_low
+    ))
+    if not is_greet_or_hru and re.search(r"\bi(?:'m| am) doing well,\s*(?:thank you\.?\s*)?how are you\b", low):
+        return ""
+    return line
+
+
+def _call_ollama_wa_reply(cfg, system_prompt, user_prompt, history_msgs, timeout=18):
+    """Ask local Ollama model to craft a contextual WhatsApp reply; auto-discovers available model if needed."""
+    import urllib.request
+    base = (cfg.get("ollama_url") or "http://localhost:11434").rstrip("/")
+    want_model = (cfg.get("ollama_model") or "qwen2.5:3b").strip()
+    models_to_try = [want_model]
+    for fallback_m in ("qwen2.5:3b", "llama3.1:8b"):
+        if fallback_m not in models_to_try:
+            models_to_try.append(fallback_m)
+    for model_name in models_to_try:
+        try:
+            payload = json.dumps({
+                "model": model_name,
+                "messages": [{"role": "system", "content": system_prompt}] + history_msgs + [{"role": "user", "content": user_prompt}],
+                "stream": False,
+                "options": {"temperature": 0.45, "num_predict": 75},
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                base + "/api/chat",
+                data=payload,
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+                ans = ((data.get("message") or {}).get("content") or "").strip()
+                if ans:
+                    return ans
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                continue
+            break
+        except Exception:
+            break
+    return ""
+
+
+def _call_free_cloud_wa_reply(system_prompt, user_prompt, history_msgs, timeout=12):
+    """Zero-key free cloud AI fallback (Pollinations OpenAI-compatible endpoint) when no API key or local Ollama is available."""
+    import urllib.request
+    try:
+        payload = json.dumps({
+            "model": "openai",
+            "messages": [{"role": "system", "content": system_prompt}] + history_msgs + [{"role": "user", "content": user_prompt}],
+            "temperature": 0.45,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://text.pollinations.ai/openai",
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "application/json", "User-Agent": "PAC-Assistant/2.0"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+            choices = data.get("choices") or []
+            if choices:
+                return ((choices[0].get("message") or {}).get("content") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def generate_whatsapp_auto_reply(sender, text, subject="", preloaded=None, cfg=None, use_ai=True):
+    """Read the incoming message `text` from `sender`, understand its exact meaning and context using
+    Google Gemini, Free AI API models (Groq / OpenRouter), Local Ollama, Claude, or Free Cloud AI,
+    and return a natural, human WhatsApp reply that directly answers what was sent."""
+    clean_txt = str(text or "").strip()
+    sender_clean = str(sender or "Friend").strip()
+    opts = suggest_prebuilt_replies(clean_txt, subject=subject, preloaded=preloaded)
+    if not clean_txt:
+        return opts[0] if opts else "Got your message, I'll get back to you shortly."
+
+    if use_ai:
+        cfg = cfg if isinstance(cfg, dict) else {}
+        recent_turns = list(_WA_CHAT_HISTORY.get(sender_clean.lower(), []))[-6:]
+        system_prompt = (
+            f"You are replying as the laptop owner (Ankush) on WhatsApp in a 1-on-1 chat with {sender_clean}. "
+            "Read their incoming message carefully — including casual English, Hinglish, Hindi/Kannada transliteration, "
+            "abbreviations (like 'yrp'=yep, 'gm'=good morning, 'gn'=good night, 'hru'=how are you, 'kaha ho'=where are you), "
+            "questions, tasks, or plans — and write a short, natural, human WhatsApp reply (1 to 2 short sentences, plain text only, "
+            "no quotes around the reply, no markdown, no emojis). "
+            "CRITICAL RULES:\n"
+            "1. Directly address the specific meaning of what they just said or asked.\n"
+            "2. NEVER reply with a generic greeting like 'Hey! I'm doing well, how are you?' unless they actually just said hello or asked how you are.\n"
+            "3. If they say 'See you tomorrow', reply about seeing them tomorrow. If they ask you to bring or send something, acknowledge that specific item.\n"
+            "4. Never sound like an AI assistant and never say 'How can I assist you today?'."
+        )
+        user_prompt = (
+            f"{sender_clean} just sent this WhatsApp message: \"{clean_txt}\"\n"
+            "Write only the exact WhatsApp reply text to send back:"
+        )
+
+        # Build provider priority list based on user preference + available keys
+        pref = str(cfg.get("wa_ai_provider") or "auto").lower()
+        bprov = str(cfg.get("brain_provider") or "ollama").lower()
+        order = []
+        for p in ([pref] if pref != "auto" else []) + ([bprov] if bprov not in ("auto",) else []) + [
+            "gemini", "groq", "openrouter", "ollama", "claude", "free"
+        ]:
+            if p not in order:
+                order.append(p)
+
+        for prov in order:
+            raw_ans = ""
+            try:
+                if prov == "gemini":
+                    gkey = gemini_key_get(cfg)
+                    if gkey:
+                        raw_ans = ask_gemini(
+                            gkey,
+                            cfg.get("gemini_model") or GEMINI_MODELS[0][0],
+                            recent_turns + [{"role": "user", "content": user_prompt}],
+                            timeout=14,
+                            system_override=system_prompt,
+                        )
+                elif prov == "groq":
+                    grkey = groq_key_get(cfg)
+                    if grkey:
+                        raw_ans = ask_groq(
+                            grkey,
+                            cfg.get("groq_model") or GROQ_MODELS[0][0],
+                            recent_turns + [{"role": "user", "content": user_prompt}],
+                            timeout=12,
+                            system_override=system_prompt,
+                        )
+                elif prov == "openrouter":
+                    orkey = openrouter_key_get(cfg)
+                    if orkey:
+                        raw_ans = ask_openrouter(
+                            orkey,
+                            cfg.get("openrouter_model") or OPENROUTER_MODELS[0][0],
+                            recent_turns + [{"role": "user", "content": user_prompt}],
+                            timeout=14,
+                            system_override=system_prompt,
+                        )
+                elif prov == "ollama":
+                    raw_ans = _call_ollama_wa_reply(cfg, system_prompt, user_prompt, recent_turns, timeout=18)
+                elif prov == "claude":
+                    ckey = claude_key_get(cfg)
+                    if ckey:
+                        raw_ans = ask_claude(
+                            ckey,
+                            cfg.get("claude_model") or CLAUDE_MODELS[0][0],
+                            recent_turns + [{"role": "user", "content": user_prompt}],
+                            timeout=12,
+                            system_override=system_prompt,
+                        )
+                elif prov == "free":
+                    raw_ans = _call_free_cloud_wa_reply(system_prompt, user_prompt, recent_turns, timeout=10)
+            except Exception:
+                raw_ans = ""
+
+            cleaned = _clean_ai_wa_reply(raw_ans, incoming_txt=clean_txt)
+            if cleaned:
+                hist = _WA_CHAT_HISTORY[sender_clean.lower()]
+                hist.append({"role": "user", "content": f"{sender_clean}: {clean_txt}"})
+                hist.append({"role": "assistant", "content": cleaned})
+                if len(hist) > 8:
+                    del hist[:-8]
+                return cleaned
+
+    fallback_reply = opts[0] if opts else "Got your message, thank you! I'll get back to you shortly."
+    hist = _WA_CHAT_HISTORY[sender_clean.lower()]
+    hist.append({"role": "user", "content": f"{sender_clean}: {clean_txt}"})
+    hist.append({"role": "assistant", "content": fallback_reply})
+    if len(hist) > 8:
+        del hist[:-8]
+    return fallback_reply
+
+
+# Simulated inbox for Sandbox Test Mode only — contains NO predefined phone numbers
+DEFAULT_TEST_WA_MESSAGES = [
+    {
+        "id": "wa_sim_1",
+        "sender": "Mom",
+        "number": "",
+        "chat_title": "Mom",
+        "text": "Beta where are you? Are you on your way home for dinner?",
+        "is_group": False,
+        "participants": 2,
+        "time": "Just now",
+    },
+    {
+        "id": "wa_sim_2",
+        "sender": "Uncle Raj",
+        "number": "",
+        "chat_title": "Family Group: Uncle Raj",
+        "jid": "family_chat@g.us",
+        "text": "Good morning everyone! Sharing family event photos.",
+        "is_group": True,
+        "participants": 18,
+        "time": "2 mins ago",
+    },
+    {
+        "id": "wa_sim_3",
+        "sender": "Rahul",
+        "number": "",
+        "chat_title": "Rahul",
+        "text": "Hey bro, are you free for a quick call about the project?",
+        "is_group": False,
+        "participants": 2,
+        "time": "4 mins ago",
+    },
+    {
+        "id": "wa_sim_4",
+        "sender": "Ananya",
+        "number": "",
+        "chat_title": "College Project Team",
+        "jid": "project_team@g.us",
+        "text": "Team, please upload your slides before 5 PM today.",
+        "is_group": True,
+        "participants": 7,
+        "time": "7 mins ago",
+    },
+    {
+        "id": "wa_sim_5",
+        "sender": "Priya",
+        "number": "",
+        "chat_title": "Priya",
+        "text": "I've sent the report PDF, please review it when you get a chance.",
+        "is_group": False,
+        "participants": 2,
+        "time": "10 mins ago",
+    },
+]
+
+DEFAULT_TEST_GMAIL_MESSAGES = [
+    {
+        "uid": "gm_sim_1",
+        "name": "Prof. Sharma",
+        "addr": "sharma@university.edu",
+        "subject": "Lab Report Review & Tomorrow's Meeting",
+        "snippet": "Hi Ankush, I attached the lab report notes. Please confirm if you can attend tomorrow's meeting at 10 AM.",
+        "is_group": False,
+        "recipient_count": 1,
+        "headers": {},
+        "labels": ["INBOX", "UNREAD"],
+    },
+    {
+        "uid": "gm_sim_2",
+        "name": "CS Department Group",
+        "addr": "cs-students@googlegroups.com",
+        "subject": "[CS-Group] Department Seminar on Friday",
+        "snippet": "All students are invited to attend the weekly department seminar in Hall B.",
+        "is_group": True,
+        "recipient_count": 60,
+        "headers": {"list-id": "<cs-students.googlegroups.com>", "precedence": "list"},
+    },
+    {
+        "uid": "gm_sim_3",
+        "name": "Rohan Verma",
+        "addr": "rohan.verma@example.com",
+        "subject": "Quick call about client presentation?",
+        "snippet": "Hey Ankush, can you call me when you're free? Need a quick update before 4 PM.",
+        "is_group": False,
+        "recipient_count": 1,
+        "headers": {},
+        "labels": ["INBOX", "UNREAD"],
+    },
+    {
+        "uid": "gm_sim_4",
+        "name": "Engineering All-Hands",
+        "addr": "lead@company.com",
+        "subject": "Weekly sync notes for everyone",
+        "snippet": "Copying the whole engineering team on the weekly sprint notes.",
+        "is_group": False,
+        "recipient_count": 9,
+        "headers": {"cc": "dev1@company.com, dev2@company.com, qa@company.com"},
+        "labels": ["INBOX", "UNREAD"],
+    },
+]
+
+
+def _load_wa_replied_ids():
+    """Load persistently stored WhatsApp message IDs that PAC has already auto-replied to."""
+    try:
+        if WA_REPLIED_FILE.exists():
+            data = json.loads(WA_REPLIED_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return set(str(x) for x in data[-300:])
+    except Exception:
+        pass
+    return set()
+
+
+def _save_wa_replied_ids(ids_set):
+    """Save replied WhatsApp message IDs so PAC never double-replies to the same message."""
+    try:
+        WA_REPLIED_FILE.write_text(json.dumps(list(ids_set)[-300:], indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _extract_sender_phone_if_present(title):
+    """If the incoming WhatsApp sender title itself is a phone number, extract its digits; otherwise return ''."""
+    s = str(title or "").strip()
+    if re.fullmatch(r"[+\d\s()-]{8,20}", s):
+        digits = re.sub(r"\D", "", s)
+        if len(digits) >= 8:
+            return digits
+    return ""
+
+
+def resolve_wa_phone_from_leveldb(msg_key="", jid=""):
+    """Extract the incoming sender's phone number dynamically from WhatsApp Desktop's live LevelDB packet log
+    (requires zero predefined phone numbers in PAC)."""
+    if OS != "Windows":
+        return ""
+    # 1. If JID itself is a standard phone JID (e.g. <digits>@c.us or <digits>@s.whatsapp.net)
+    if jid and re.match(r"^\d{8,15}@(?:\bc\.us\b|\bs\.whatsapp\.net\b)", str(jid), re.I):
+        return re.sub(r"\D", "", str(jid).split("@")[0])
+    # 2. Scan WhatsApp Desktop's IndexedDB LevelDB .log and .ldb files for sender_pn near msg_key / jid
+    import glob
+    pkgs = glob.glob(os.path.expandvars(r"%LOCALAPPDATA%\Packages\5319275A.WhatsAppDesktop_*"))
+    needles = [str(x).encode("utf-8", "ignore") for x in (msg_key, jid) if x]
+    if not needles:
+        return ""
+    for pkg in pkgs:
+        ldb_dir = os.path.join(pkg, r"LocalCache\EBWebView\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb")
+        if not os.path.isdir(ldb_dir):
+            continue
+        logs = sorted(glob.glob(os.path.join(ldb_dir, "*.log")), key=os.path.getmtime, reverse=True)[:2]
+        ldbs = sorted(glob.glob(os.path.join(ldb_dir, "*.ldb")), key=os.path.getmtime, reverse=True)[:4]
+        for fpath in logs + ldbs:
+            try:
+                with open(fpath, "rb") as f:
+                    data = f.read()
+                for needle in needles:
+                    for m in re.finditer(re.escape(needle), data):
+                        window = data[max(0, m.start() - 120): min(len(data), m.end() + 500)]
+                        m_pn = re.search(rb"sender_pn\xfa\xff([\x04-\x08])", window)
+                        if m_pn:
+                            ln = m_pn.group(1)[0]
+                            raw_bcd = window[m_pn.end(): m_pn.end() + ln]
+                            digits = re.sub(r"\D", "", raw_bcd.hex())
+                            if 8 <= len(digits) <= 15:
+                                return digits
+            except Exception:
+                pass
+    return ""
+
+
+def _load_wa_msg_cache():
+    """Load cached WhatsApp notification texts so messages remain readable even after WhatsApp clears the toast."""
+    try:
+        cache_file = DATA_DIR / "wa_msg_cache.json"
+        if cache_file.exists():
+            data = json.loads(cache_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_wa_msg_cache(cache_dict):
+    try:
+        cache_file = DATA_DIR / "wa_msg_cache.json"
+        # Keep only the last 100 entries
+        items = list(cache_dict.items())[-100:]
+        cache_file.write_text(json.dumps(dict(items), indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _query_wpndatabase_rows(db_path):
+    """Read WhatsApp toast notification rows from Windows wpndatabase.db (+ WAL) without failing on byte-range locks."""
+    import sqlite3
+    sql = (
+        "SELECT n.Id, h.PrimaryId, CAST(n.Payload AS TEXT), n.ArrivalTime "
+        "FROM Notification n LEFT JOIN NotificationHandler h ON n.HandlerId = h.RecordId "
+        "WHERE n.Type = 'toast' "
+        "  AND (h.PrimaryId LIKE '%WhatsApp%' OR CAST(n.Payload AS TEXT) LIKE '%web.whatsapp.com%' "
+        "       OR CAST(n.Payload AS TEXT) LIKE '%WhatsApp%') "
+        "ORDER BY n.ArrivalTime ASC"
+    )
+    # 1. Primary: SQLite read-only URI mode (uses SQLite shared locks and reads live WAL directly without WinError 33)
+    for attempt in range(3):
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=4.0)
+            try:
+                cur = conn.cursor()
+                cur.execute(sql)
+                return cur.fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            time.sleep(0.12)
+    # 2. Fallback: raw stream copy to temp dir (avoids CopyFile2 byte-range lock error)
+    tmp_dir = tempfile.mkdtemp(prefix="pac_wpn_")
+    try:
+        for ext in ("", "-wal", "-shm"):
+            src = db_path + ext
+            if os.path.exists(src):
+                try:
+                    with open(src, "rb") as fsrc, open(os.path.join(tmp_dir, "wpn.db" + ext), "wb") as fdst:
+                        fdst.write(fsrc.read())
+                except Exception:
+                    pass
+        conn = sqlite3.connect(os.path.join(tmp_dir, "wpn.db"), timeout=4.0)
+        try:
+            cur = conn.cursor()
+            cur.execute(sql)
+            return cur.fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        logger.exception("wpndatabase.db read failed")
+        return []
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _refresh_wa_msg_cache_from_wpn():
+    """Update wa_msg_cache.json from wpndatabase.db and return (msg_cache, rows, now_ts)."""
+    import xml.etree.ElementTree as ET
+    from urllib.parse import unquote
+    msg_cache = _load_wa_msg_cache()
+    cache_dirty = False
+    db_path = os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db")
+    rows = _query_wpndatabase_rows(db_path) if os.path.exists(db_path) else []
+    now_ts = time.time()
+    parsed_rows = []
+    for nid, handler, payload, arrival_ft in rows:
+        if not payload:
+            continue
+        arrival_ts = (int(arrival_ft) - 116444736000000000) / 10_000_000.0 if arrival_ft else now_ts
+        try:
+            root = ET.fromstring(payload)
+        except Exception:
+            continue
+        launch = html_unescape(root.attrib.get("launch", ""))
+        qs = parse_qs(launch)
+        msg_key = unquote((qs.get("key") or [""])[0])
+        if msg_key.startswith("msg:"):
+            msg_key = msg_key[4:]
+        jid = unquote((qs.get("tag") or [""])[0])
+        texts = [(el.text or "").strip() for el in root.findall(".//binding/text") if (el.text or "").strip()]
+        if len(texts) < 2:
+            continue
+        sender = texts[0]
+        body = " ".join(texts[1:]).strip()
+        if msg_key and body and msg_cache.get(msg_key) != {"sender": sender, "text": body}:
+            msg_cache[msg_key] = {"sender": sender, "text": body}
+            cache_dirty = True
+        parsed_rows.append((nid, msg_key, jid, texts, sender, body, arrival_ts))
+    if cache_dirty:
+        _save_wa_msg_cache(msg_cache)
+    return msg_cache, parsed_rows, now_ts
+
+
+def fetch_whatsapp_leveldb_incoming(cfg, max_age_secs=None):
+    """Detect incoming WhatsApp messages from WhatsApp Desktop's LevelDB (.log and .ldb),
+    pairing each message key with its real notification/media text (never fabricating 'Hi')."""
+    if OS != "Windows":
+        return []
+    import glob
+    contacts = {k.lower(): v for k, v in (cfg.get("contacts") or {}).items()}
+    num_to_name = {re.sub(r"\D", "", str(v))[-10:]: k for k, v in (cfg.get("contacts") or {}).items() if re.sub(r"\D", "", str(v))}
+    msg_cache = _load_wa_msg_cache()
+    pkgs = glob.glob(os.path.expandvars(r"%LOCALAPPDATA%\Packages\5319275A.WhatsAppDesktop_*"))
+    out = {}
+    now_ts = time.time()
+    rechecked_wpn = False
+    for pkg in pkgs:
+        ldb_dir = os.path.join(pkg, r"LocalCache\EBWebView\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb")
+        if not os.path.isdir(ldb_dir):
+            continue
+        logs = sorted(glob.glob(os.path.join(ldb_dir, "*.log")), key=os.path.getmtime, reverse=True)[:2]
+        ldbs = sorted(glob.glob(os.path.join(ldb_dir, "*.ldb")), key=os.path.getmtime, reverse=True)[:3]
+        for log_path in logs + ldbs:
+            try:
+                with open(log_path, "rb") as f:
+                    data = f.read()
+            except Exception:
+                continue
+            notif_times = {}
+            for m in re.finditer(
+                rb"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\.\d+:\[log\] \[showMessageNotification\] start key=msg:(false_[^\x00\"\s]+)",
+                data,
+            ):
+                ts_str = m.group(1).decode("ascii", "ignore")
+                mkey = m.group(2).decode("utf-8", "ignore")
+                try:
+                    dt = datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                    notif_times.setdefault(mkey, dt.timestamp())
+                except Exception:
+                    pass
+
+            for m in re.finditer(rb'"\x06msgKey":(false_[^\x00"]+)', data):
+                mkey = m.group(1).decode("utf-8", "ignore")
+                window = data[m.start(): min(len(data), m.end() + 550)]
+                sender_name = ""
+                phone = ""
+                m_pn = re.search(rb"\xfc([\x01-\x40])([^\x00\xfc\xfa]{1,64})\xfc\tsender_pn\xfa\xff([\x04-\x08])", window)
+                if m_pn:
+                    name_len = m_pn.group(1)[0]
+                    raw_name = m_pn.group(2)
+                    sender_name = raw_name[-name_len:].decode("utf-8", "ignore").strip()
+                    pn_len = m_pn.group(3)[0]
+                    raw_bcd = window[m_pn.end(): m_pn.end() + pn_len]
+                    digits = re.sub(r"\D", "", raw_bcd.hex())
+                    if 8 <= len(digits) <= 15:
+                        phone = digits
+                jid = mkey[6:].split("_")[0] if mkey.startswith("false_") else ""
+                is_grp = jid.lower().endswith(("@g.us", "@broadcast", "@newsletter"))
+                arr_ts = notif_times.get(mkey, os.path.getmtime(log_path))
+                if max_age_secs is not None and (now_ts - arr_ts) > float(max_age_secs):
+                    continue
+                cached = msg_cache.get(mkey) or {}
+                body_txt = (cached.get("text") or "").strip()
+                # If a brand-new message just hit LevelDB before wpndatabase.db finished writing the toast, wait briefly and re-read wpndatabase.db
+                if not body_txt and not rechecked_wpn and (now_ts - arr_ts) < 12.0:
+                    rechecked_wpn = True
+                    time.sleep(0.55)
+                    msg_cache, _, _ = _refresh_wa_msg_cache_from_wpn()
+                    cached = msg_cache.get(mkey) or {}
+                    body_txt = (cached.get("text") or "").strip()
+                # Check if LevelDB explicitly marks this stanza as a media message (image/video/audio/sticker/document)
+                if not body_txt:
+                    stanza_id = mkey.rsplit("_", 1)[-1].encode("ascii", "ignore")
+                    if stanza_id and len(stanza_id) >= 12:
+                        for m_id in re.finditer(re.escape(stanza_id), data):
+                            near = data[max(0, m_id.start() - 120): min(len(data), m_id.end() + 420)]
+                            if b"type: image" in near or b'"image/jpeg"' in near or b".image\"" in near:
+                                body_txt = "Photo"
+                                break
+                            if b"type: video" in near or b'"video/mp4"' in near:
+                                body_txt = "Video"
+                                break
+                            if b"type: ptt" in near or b"type: audio" in near or b'"audio/ogg"' in near:
+                                body_txt = "Voice message"
+                                break
+                            if b"type: sticker" in near or b'"image/webp"' in near:
+                                body_txt = "Sticker"
+                                break
+                            if b"type: document" in near:
+                                body_txt = "Document"
+                                break
+                # Never fabricate "Hi" when message text is not yet available
+                if not body_txt:
+                    continue
+                disp_sender = cached.get("sender") or sender_name or num_to_name.get(phone[-10:], "") or phone or jid.split("@")[0]
+                if not phone and disp_sender:
+                    phone = contacts.get(disp_sender.lower(), "") or _extract_sender_phone_if_present(disp_sender)
+                msg = {
+                    "id": mkey,
+                    "sender": disp_sender,
+                    "number": phone,
+                    "chat_title": disp_sender,
+                    "jid": jid,
+                    "text": body_txt,
+                    "is_group": is_grp,
+                    "participants": 3 if is_grp else 2,
+                    "time": datetime.datetime.fromtimestamp(arr_ts).strftime("%I:%M %p"),
+                    "arrival_ts": arr_ts,
+                }
+                is_grp2, reason = is_whatsapp_group(msg)
+                msg["is_group"] = is_grp or is_grp2
+                msg["group_reason"] = reason
+                out[mkey] = msg
+    return list(out.values())
+
+
+def fetch_live_whatsapp_notifications(cfg, max_age_secs=None):
+    """Read incoming WhatsApp notifications directly from the Windows Notification SQLite database
+    (wpndatabase.db + WAL) and WhatsApp Desktop's live LevelDB log in pure Python, with zero predefined phone numbers."""
+    if OS != "Windows":
+        return []
+    contacts = {k.lower(): v for k, v in (cfg.get("contacts") or {}).items()}
+    _, parsed_rows, now_ts = _refresh_wa_msg_cache_from_wpn()
+    out = []
+    seen_ids = set()
+    for nid, msg_key, jid, texts, sender, body, arrival_ts in parsed_rows:
+        if max_age_secs is not None and (now_ts - arrival_ts) > float(max_age_secs):
+            continue
+        likely_grp = len(texts) >= 3 or str(jid).lower().endswith(("@g.us", "@broadcast", "@newsletter"))
+        num = (
+            resolve_wa_phone_from_leveldb(msg_key=msg_key, jid=jid)
+            or contacts.get(sender.lower(), "")
+            or _extract_sender_phone_if_present(sender)
+        )
+        mid = msg_key or f"wa_wpn_{nid}_{hashlib.md5((sender + '|' + body).encode('utf-8', 'ignore')).hexdigest()[:8]}"
+        t_str = datetime.datetime.fromtimestamp(arrival_ts).strftime("%I:%M %p") if arrival_ts else "Live"
+        msg = {
+            "id": mid,
+            "notif_id": nid,
+            "sender": sender,
+            "number": num,
+            "chat_title": sender,
+            "jid": jid,
+            "text": body,
+            "is_group": likely_grp,
+            "participants": 3 if likely_grp else 2,
+            "time": t_str,
+            "arrival_ts": arrival_ts,
+        }
+        is_grp, reason = is_whatsapp_group(msg)
+        msg["is_group"] = is_grp
+        msg["group_reason"] = reason
+        out.append(msg)
+        seen_ids.add(mid)
+    # Also merge any incoming messages recorded in WhatsApp Desktop's LevelDB log whose text is cached/known
+    for lmsg in fetch_whatsapp_leveldb_incoming(cfg, max_age_secs=max_age_secs):
+        if lmsg["id"] not in seen_ids and lmsg.get("text"):
+            out.append(lmsg)
+            seen_ids.add(lmsg["id"])
+    return out
+
+
+def fetch_open_whatsapp_window_messages(cfg):
+    """Inspect an open WhatsApp Desktop or WhatsApp Web window via Windows UI Automation to read what has been sent
+    in the active or unread chats (no predefined phone numbers required)."""
+    if OS != "Windows":
+        return []
+    ps_script = (
+        "Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes; "
+        "$root = [System.Windows.Automation.AutomationElement]::RootElement; "
+        "$cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Window); "
+        "$wins = $root.FindAll([System.Windows.Automation.TreeScope]::Children, $cond); "
+        "$out = @(); "
+        "foreach ($w in $wins) { "
+        "  $wname = $w.Current.Name; "
+        "  if ($wname -match 'WhatsApp') { "
+        "    $tcond = New-Object System.Windows.Automation.OrCondition("
+        "      (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)),"
+        "      (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::ListItem)),"
+        "      (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Group))"
+        "    ); "
+        "    $els = $w.FindAll([System.Windows.Automation.TreeScope]::Descendants, $tcond); "
+        "    $names = @(); "
+        "    foreach ($el in $els) { "
+        "      $n = [string]$el.Current.Name; "
+        "      if ($n -and $n.Trim().Length -gt 1) { $names += $n.Trim() } "
+        "    }; "
+        "    $out += @{ window = $wname; texts = $names }; "
+        "    break; "
+        "  } "
+        "}; "
+        "$out | ConvertTo-Json -Depth 4 -Compress"
+    )
+    try:
+        raw = subprocess.check_output(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            timeout=6, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).decode("utf-8", errors="ignore").strip()
+        if not raw:
+            return []
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        contacts = {k.lower(): v for k, v in (cfg.get("contacts") or {}).items()}
+        skip_ui = {
+            "whatsapp", "chats", "calls", "status", "archived", "starred messages", "settings", "profile",
+            "search or start a new chat", "search", "type a message", "unread", "online", "typing...",
+            "end-to-end encrypted", "today", "yesterday",
+        }
+        out = []
+        for win_entry in parsed:
+            texts = [str(x).strip() for x in (win_entry.get("texts") or []) if str(x).strip()]
+            sender = ""
+            latest_msg = ""
+            for t in texts:
+                low = t.lower()
+                if low in skip_ui or len(t) > 500:
+                    continue
+                m_unread = re.search(r"^([^,\n]{2,45}),\s*(.+?),\s*\d{1,2}:\d{2}\s*(?:AM|PM)?(?:,\s*\d+\s*unread)?", t, re.I)
+                if m_unread:
+                    cand_sender = m_unread.group(1).strip()
+                    cand_body = m_unread.group(2).strip()
+                    if cand_sender.lower() not in skip_ui and cand_body:
+                        num = contacts.get(cand_sender.lower(), "") or _extract_sender_phone_if_present(cand_sender)
+                        msg = {
+                            "id": f"wa_win_{hashlib.md5((cand_sender + '|' + cand_body).encode('utf-8', 'ignore')).hexdigest()[:10]}",
+                            "sender": cand_sender,
+                            "number": num,
+                            "chat_title": cand_sender,
+                            "text": cand_body,
+                            "is_group": False,
+                            "participants": 2,
+                            "time": "Open Window",
+                        }
+                        is_grp, reason = is_whatsapp_group(msg)
+                        msg["is_group"] = is_grp
+                        msg["group_reason"] = reason
+                        out.append(msg)
+                        continue
+                if not sender and 2 <= len(t) <= 40 and not re.search(r"^\d{1,2}:\d{2}", t):
+                    sender = t
+                elif sender and len(t) >= 2 and not re.fullmatch(r"\d{1,2}:\d{2}(?:\s*[AP]M)?", t, re.I):
+                    latest_msg = t
+            if not out and sender and latest_msg and sender != latest_msg:
+                num = contacts.get(sender.lower(), "") or _extract_sender_phone_if_present(sender)
+                msg = {
+                    "id": f"wa_active_{hashlib.md5((sender + '|' + latest_msg).encode('utf-8', 'ignore')).hexdigest()[:10]}",
+                    "sender": sender,
+                    "number": num,
+                    "chat_title": sender,
+                    "text": latest_msg,
+                    "is_group": False,
+                    "participants": 2,
+                    "time": "Active Chat",
+                }
+                is_grp, reason = is_whatsapp_group(msg)
+                msg["is_group"] = is_grp
+                msg["group_reason"] = reason
+                out.append(msg)
+        return out
+    except Exception:
+        return []
+
+
+def fetch_incoming_whatsapp_messages(cfg, max_age_secs=None):
+    """Fetch incoming WhatsApp messages from Windows toast notifications (wpndatabase.db) first,
+    then fall back to inspecting the open WhatsApp window if no notifications are found."""
+    msgs = fetch_live_whatsapp_notifications(cfg, max_age_secs=max_age_secs)
+    if msgs:
+        return msgs
+    if max_age_secs is None:
+        return fetch_open_whatsapp_window_messages(cfg)
+    return []
+
+
+def _copy_to_clipboard(text):
+    """Copy Unicode text to the Windows clipboard so it can be pasted into WhatsApp cleanly."""
+    if OS == "Windows":
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "Set-Clipboard -Value ([Console]::In.ReadToEnd())"],
+                input=str(text).encode("utf-8"),
+                creationflags=NO_WINDOW,
+                timeout=4,
+            )
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _focus_whatsapp_window():
+    """Explicitly bring WhatsApp to the foreground right before sending keystrokes."""
+    if OS == "Windows":
+        try:
+            ps_focus = (
+                "$ws = New-Object -ComObject WScript.Shell; "
+                "if ($ws.AppActivate('WhatsApp')) { Write-Output 'FOCUSED' } else { Write-Output 'NONE' }"
+            )
+            res = subprocess.check_output(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_focus],
+                timeout=3, stderr=subprocess.DEVNULL, creationflags=NO_WINDOW,
+            ).decode("utf-8", errors="ignore").strip()
+            if "FOCUSED" in res:
+                time.sleep(0.25)
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _unfocus_whatsapp_after_auto():
+    """Exit the open WhatsApp chat and minimize WhatsApp to the background after an auto-reply
+    so Windows Toast Notifications fire with full message text for all subsequent incoming messages."""
+    try:
+        pyautogui.press("esc")
+        time.sleep(0.18)
+        pyautogui.press("esc")
+        time.sleep(0.15)
+        if OS == "Windows":
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            if hwnd:
+                buf = ctypes.create_unicode_buffer(256)
+                user32.GetWindowTextW(hwnd, buf, 255)
+                if "whatsapp" in (buf.value or "").lower():
+                    user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+    except Exception:
+        pass
+
+
+def _wait_for_wa_compose_ready(min_wait=2.2, max_wait=6.5):
+    """Wait until WhatsApp Desktop's LevelDB log reports that the chat compose input box is focused and ready
+    (BEGIN_EDITING screen=chat target=data-testid=conversation-compose-box-input), or until max_wait elapses."""
+    import glob
+    t0 = time.time()
+    pkgs = glob.glob(os.path.expandvars(r"%LOCALAPPDATA%\Packages\5319275A.WhatsAppDesktop_*")) if OS == "Windows" else []
+    log_path = None
+    for pkg in pkgs:
+        ldb_dir = os.path.join(pkg, r"LocalCache\EBWebView\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb")
+        if os.path.isdir(ldb_dir):
+            logs = sorted(glob.glob(os.path.join(ldb_dir, "*.log")), key=os.path.getmtime, reverse=True)
+            if logs:
+                log_path = logs[0]
+                break
+    initial_size = 0
+    if log_path:
+        try:
+            initial_size = max(0, os.path.getsize(log_path) - 4096)
+        except Exception:
+            initial_size = 0
+    time.sleep(min_wait)
+    while (time.time() - t0) < max_wait:
+        if log_path:
+            try:
+                with open(log_path, "rb") as f:
+                    f.seek(initial_size)
+                    tail = f.read()
+                if b"conversation-compose-box-input" in tail or b"SCREEN_CHANGED screen=open-chat-starting dest=chat" in tail:
+                    time.sleep(0.6)
+                    return True
+            except Exception:
+                pass
+        time.sleep(0.35)
+    return False
+
+
+def _focus_or_open_whatsapp(wait_secs=5.0):
+    """Bring an open WhatsApp window to the foreground, or launch WhatsApp if it isn't open yet."""
+    if OS == "Windows":
+        if _focus_whatsapp_window():
+            time.sleep(0.4)
+            return True
+        if protocol_registered("whatsapp"):
+            try:
+                os.startfile("whatsapp://")  # type: ignore[attr-defined]
+                time.sleep(max(2.5, float(wait_secs)))
+                _focus_whatsapp_window()
+                return True
+            except Exception:
+                pass
+    webbrowser.open("https://web.whatsapp.com")
+    time.sleep(max(3.0, float(wait_secs)))
+    return True
+
+
+def send_whatsapp_by_chat_name(sender, message, wait_secs=5.0):
+    """Send a WhatsApp message to `sender` by searching their chat name in WhatsApp Desktop/Web —
+    requires NO predefined phone number."""
+    _focus_or_open_whatsapp(wait_secs=wait_secs)
+    _focus_whatsapp_window()
+    # Exit any currently open modal/chat first, then open chat search (Ctrl+F / Ctrl+Alt+/)
+    pyautogui.press("esc")
+    time.sleep(0.2)
+    pyautogui.hotkey("ctrl", "f")
+    time.sleep(0.4)
+    pyautogui.hotkey("ctrl", "a")
+    time.sleep(0.1)
+    if _copy_to_clipboard(sender):
+        pyautogui.hotkey("ctrl", "v")
+    else:
+        pyautogui.write(sender, interval=0.02)
+    time.sleep(1.1)
+    pyautogui.press("down")
+    time.sleep(0.3)
+    pyautogui.press("enter")
+    time.sleep(0.8)
+    _focus_whatsapp_window()
+    # Paste or type the reply message into the active chat input box and press Enter
+    if _copy_to_clipboard(message):
+        pyautogui.hotkey("ctrl", "v")
+    else:
+        pyautogui.write(message, interval=0.01)
+    time.sleep(0.35)
+    pyautogui.press("enter")
+    time.sleep(1.1)
+    # Exit chat and minimize WhatsApp so subsequent incoming messages trigger Windows toast notifications with full text
+    _unfocus_whatsapp_after_auto()
 
 
 # --------------------------------------------------------------- misc helpers
@@ -2379,14 +3600,14 @@ HELP_TEXT = (
     "  - search for <anything>  |  who is ...  |  play <song> (YouTube)\n"
     "  - any question I can't answer from your facts is looked up quietly on the web (no prompt, no browser window)\n"
     "  - open in a new tab  (shows your last search on Google)  |  search for <anything> in a new tab\n"
-    "  - send message 2 to mom  |  message mom saying I'll be late\n"
+    "  - send message 2 to mom  |  message mom saying I'll be late  |  read and auto reply whatsapp  |  turn on whatsapp auto reply\n"
     "  - type hello world  |  start typing ... stop typing\n"
     "  - shut down / restart / lock (asks first)\n"
     "  - note buy milk  |  open notes (opens Notepad)  |  read my notes\n"
     "  - learn that the wifi password is blue42  |  what is the wifi password  (answered offline)\n"
     "  - open my facts (your knowledge file in Notepad)\n"
     "  - MEMORY: my name is Ankush  |  I prefer tea in the morning  |  every morning I go for a walk  |  my wife is Priya\n"
-    "  - my mom's number is 9876543210  (saved to contacts, so 'message my wife saying hi' works)  |  call me boss\n"
+    "  - my mom's number is <your-number>  (saved to contacts, so 'message my wife saying hi' works)  |  call me boss\n"
     "  - my taxes folder is documents/taxes  (a nickname the file manager understands: 'move report pdf to taxes')\n"
     "  - what do you remember about me  |  forget about tea  |  forget that  |  forget everything  |  turn off memory\n"
     "  - check my mail  |  delete mail 2  |  delete mails from amazon  |  review my mail\n"
@@ -2459,7 +3680,22 @@ def rank_voices(voices):
     return [(vid, name) for _, vid, name in ranked]
 
 
-# --------------------------------------------------------------- Claude (optional, only when you ask)
+# --------------------------------------------------------------- AI Models: Google Gemini, Free AI (Groq / OpenRouter), Claude & Ollama
+GEMINI_MODELS = [
+    ("gemini-2.5-flash", "Gemini 2.5 Flash - fast, smart (Recommended)"),
+    ("gemini-2.5-pro", "Gemini 2.5 Pro - deepest reasoning (Premium plan)"),
+    ("gemini-2.0-flash", "Gemini 2.0 Flash - ultra-low latency"),
+]
+GROQ_MODELS = [
+    ("llama-3.3-70b-versatile", "Llama 3.3 70B Versatile (Free API - Best)"),
+    ("llama-3.1-8b-instant", "Llama 3.1 8B Instant (Free API - Fastest)"),
+    ("gemma2-9b-it", "Google Gemma 2 9B (Free API)"),
+]
+OPENROUTER_MODELS = [
+    ("google/gemini-2.0-flash-exp:free", "Google Gemini 2.0 Flash (OpenRouter Free)"),
+    ("meta-llama/llama-3.3-70b-instruct:free", "Meta Llama 3.3 70B Instruct (OpenRouter Free)"),
+    ("qwen/qwen-2.5-72b-instruct:free", "Qwen 2.5 72B Instruct (OpenRouter Free)"),
+]
 CLAUDE_MODELS = [("claude-haiku-4-5-20251001", "Haiku 4.5 - fast, cheapest"),
                  ("claude-sonnet-5-5", "Sonnet 5.5 - smarter, a bit slower")]
 CLAUDE_SYSTEM = (
@@ -2469,27 +3705,82 @@ CLAUDE_SYSTEM = (
     "commands do that - so don't claim to. If you are unsure, say so plainly. Do not add 'sir'; PAC does that.")
 
 
-def claude_key_get(cfg):
-    try:
-        import keyring
-        v = keyring.get_password("pac-claude", "api-key")
+def _ai_secret_get(cfg, service_name, cfg_key, env_names=()):
+    for env_k in env_names:
+        v = (os.environ.get(env_k) or "").strip()
         if v:
             return v
+    try:
+        import keyring
+        v = keyring.get_password(service_name, "api-key")
+        if v:
+            return v.strip()
     except Exception:
         pass
-    return cfg.get("claude_api_key", "")
+    return str((cfg or {}).get(cfg_key, "") or "").strip()
+
+
+def _ai_secret_set(cfg, service_name, cfg_key, key):
+    key = str(key or "").strip()
+    try:
+        import keyring
+        keyring.set_password(service_name, "api-key", key)
+        cfg[cfg_key] = ""
+        return "in your system credential store"
+    except Exception:
+        cfg[cfg_key] = key
+        return "in ~/.pac/config.json"
+
+
+def gemini_key_get(cfg):
+    return _ai_secret_get(cfg, "pac-gemini", "gemini_api_key", ("GEMINI_API_KEY", "GOOGLE_API_KEY"))
+
+
+def gemini_key_set(cfg, key):
+    return _ai_secret_set(cfg, "pac-gemini", "gemini_api_key", key)
+
+
+def groq_key_get(cfg):
+    return _ai_secret_get(cfg, "pac-groq", "groq_api_key", ("GROQ_API_KEY",))
+
+
+def groq_key_set(cfg, key):
+    return _ai_secret_set(cfg, "pac-groq", "groq_api_key", key)
+
+
+def openrouter_key_get(cfg):
+    return _ai_secret_get(cfg, "pac-openrouter", "openrouter_api_key", ("OPENROUTER_API_KEY",))
+
+
+def openrouter_key_set(cfg, key):
+    return _ai_secret_set(cfg, "pac-openrouter", "openrouter_api_key", key)
+
+
+def claude_key_get(cfg):
+    return _ai_secret_get(cfg, "pac-claude", "claude_api_key", ("ANTHROPIC_API_KEY",))
 
 
 def claude_key_set(cfg, key):
     """Keep the key in the system credential store if 'keyring' is installed, else in ~/.pac/config.json."""
-    try:
-        import keyring
-        keyring.set_password("pac-claude", "api-key", key)
-        cfg["claude_api_key"] = ""
-        return "in your system credential store"
-    except Exception:
-        cfg["claude_api_key"] = key
-        return "in ~/.pac/config.json (pip install keyring to use the credential store instead)"
+    return _ai_secret_set(cfg, "pac-claude", "claude_api_key", key)
+
+
+def active_wa_ai_summary(cfg):
+    """Return a short human-readable summary of the active AI model for WhatsApp understanding & auto-reply."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    pref = str(cfg.get("wa_ai_provider") or "auto").lower()
+    if pref == "gemini" or (pref == "auto" and gemini_key_get(cfg)):
+        if gemini_key_get(cfg):
+            return f"Google Gemini ({cfg.get('gemini_model') or GEMINI_MODELS[0][0]})"
+    if pref == "groq" or (pref == "auto" and groq_key_get(cfg)):
+        if groq_key_get(cfg):
+            return f"Groq Free AI ({cfg.get('groq_model') or GROQ_MODELS[0][0]})"
+    if pref == "openrouter" or (pref == "auto" and openrouter_key_get(cfg)):
+        if openrouter_key_get(cfg):
+            return f"OpenRouter Free AI ({cfg.get('openrouter_model') or OPENROUTER_MODELS[0][0]})"
+    if pref == "claude" and claude_key_get(cfg):
+        return f"Anthropic Claude ({cfg.get('claude_model') or CLAUDE_MODELS[0][0]})"
+    return f"Local Ollama ({cfg.get('ollama_model') or 'qwen2.5:3b'}) + Free Cloud AI Fallback"
 
 
 class ClaudeError(Exception):
@@ -2498,14 +3789,126 @@ class ClaudeError(Exception):
         self.kind = kind      # no_key / auth / rate / offline / error
 
 
-def ask_claude(api_key, model, history, timeout=40, url="https://api.anthropic.com/v1/messages", system_extra=""):
+def ask_gemini(api_key, model, history, timeout=30, system_extra="", system_override=None):
+    """Call Google Gemini generateContent API using the standard library."""
+    import urllib.request
+    import urllib.error
+    if not api_key:
+        raise ClaudeError("no Google Gemini API key set", "no_key")
+    model = (model or GEMINI_MODELS[0][0]).strip()
+    system = system_override if system_override is not None else (CLAUDE_SYSTEM + ("\n\n" + system_extra if system_extra else ""))
+    contents = []
+    for turn in (history or []):
+        role = "model" if turn.get("role") == "assistant" else "user"
+        contents.append({"role": role, "parts": [{"text": str(turn.get("content") or "")}]})
+    if not contents:
+        contents = [{"role": "user", "parts": [{"text": "Hello"}]}]
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{quote(model)}:generateContent?key={quote(api_key)}"
+    body = json.dumps({
+        "systemInstruction": {"parts": [{"text": system}]},
+        "contents": contents,
+        "generationConfig": {"temperature": 0.45, "maxOutputTokens": 400},
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = json.loads(e.read().decode("utf-8", "replace")).get("error", {}).get("message", "")
+        except Exception:
+            pass
+        if e.code in (400, 401, 403) and ("key" in detail.lower() or e.code in (401, 403)):
+            raise ClaudeError(f"Google Gemini didn't accept the API key ({detail or e.code})", "auth")
+        if e.code == 429:
+            raise ClaudeError("Google Gemini is rate-limiting this key right now", "rate")
+        raise ClaudeError(f"Google Gemini returned an error ({e.code}) {detail}".strip(), "error")
+    except (urllib.error.URLError, OSError) as e:
+        raise ClaudeError(f"couldn't reach Google Gemini ({getattr(e, 'reason', e)})", "offline")
+    cands = data.get("candidates") or []
+    parts = ((cands[0].get("content") or {}).get("parts") or []) if cands else []
+    text = "".join(str(p.get("text") or "") for p in parts).strip()
+    if not text:
+        raise ClaudeError("Google Gemini sent back an empty reply", "error")
+    return re.sub(r"[*_#`]+", "", text)
+
+
+def _ask_openai_chat(url, api_key, model, history, timeout=25, system_extra="", system_override=None, provider_label="AI"):
+    """Call an OpenAI-compatible Chat Completions endpoint (Groq / OpenRouter) using only the standard library."""
+    import urllib.request
+    import urllib.error
+    if not api_key:
+        raise ClaudeError(f"no {provider_label} API key set", "no_key")
+    system = system_override if system_override is not None else (CLAUDE_SYSTEM + ("\n\n" + system_extra if system_extra else ""))
+    msgs = [{"role": "system", "content": system}] + [
+        {"role": ("assistant" if m.get("role") == "assistant" else "user"), "content": str(m.get("content") or "")}
+        for m in (history or [])
+    ]
+    body = json.dumps({"model": model, "messages": msgs, "max_tokens": 350, "temperature": 0.45}).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "PAC-Assistant/2.0",
+    }
+    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = json.loads(e.read().decode("utf-8", "replace")).get("error", {}).get("message", "")
+        except Exception:
+            pass
+        if e.code in (401, 403):
+            raise ClaudeError(f"{provider_label} didn't accept the API key ({detail or e.code})", "auth")
+        if e.code == 429:
+            raise ClaudeError(f"{provider_label} is rate-limiting right now", "rate")
+        raise ClaudeError(f"{provider_label} returned an error ({e.code}) {detail}".strip(), "error")
+    except (urllib.error.URLError, OSError) as e:
+        raise ClaudeError(f"couldn't reach {provider_label} ({getattr(e, 'reason', e)})", "offline")
+    choices = data.get("choices") or []
+    text = ((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
+    if not text:
+        raise ClaudeError(f"{provider_label} sent back an empty reply", "error")
+    return re.sub(r"[*_#`]+", "", text)
+
+
+def ask_groq(api_key, model, history, timeout=25, system_extra="", system_override=None):
+    return _ask_openai_chat(
+        "https://api.groq.com/openai/v1/chat/completions",
+        api_key,
+        model or GROQ_MODELS[0][0],
+        history,
+        timeout=timeout,
+        system_extra=system_extra,
+        system_override=system_override,
+        provider_label="Groq",
+    )
+
+
+def ask_openrouter(api_key, model, history, timeout=25, system_extra="", system_override=None):
+    return _ask_openai_chat(
+        "https://openrouter.ai/api/v1/chat/completions",
+        api_key,
+        model or OPENROUTER_MODELS[0][0],
+        history,
+        timeout=timeout,
+        system_extra=system_extra,
+        system_override=system_override,
+        provider_label="OpenRouter",
+    )
+
+
+def ask_claude(api_key, model, history, timeout=40, url="https://api.anthropic.com/v1/messages", system_extra="", system_override=None):
     """One round trip to the Claude Messages API using only the standard library. `history` is a list of
     {"role": "user"|"assistant", "content": str} ending with the user's message. Returns the reply text."""
     import urllib.request
     import urllib.error
     if not api_key:
         raise ClaudeError("no API key set", "no_key")
-    system = CLAUDE_SYSTEM + ("\n\n" + system_extra if system_extra else "")
+    system = system_override if system_override is not None else (CLAUDE_SYSTEM + ("\n\n" + system_extra if system_extra else ""))
     body = json.dumps({"model": model, "max_tokens": 400, "system": system, "messages": history}).encode()
     req = urllib.request.Request(url, data=body, method="POST", headers={
         "content-type": "application/json", "x-api-key": api_key, "anthropic-version": "2023-06-01"})
@@ -2532,11 +3935,10 @@ def ask_claude(api_key, model, history, timeout=40, url="https://api.anthropic.c
 
 
 # --------------------------------------------------------------- LLM brain (optional): understands any phrasing
-# Instead of matching your sentence against fixed patterns, a language model (Claude online, or a local Ollama
-# model fully offline) picks one of PAC's tools. The tool is turned into an ordinary PAC command and run through
-# the same handlers, confirmations ("shall I send it?") and face locks as before.
+# Instead of matching your sentence against fixed patterns, a language model (Google Gemini, Free Groq/OpenRouter,
+# Claude online, or a local Ollama model fully offline) picks one of PAC's tools.
 BRAIN_MODES = ("rules", "hybrid", "llm")      # rules = old pattern matching only; hybrid = patterns first, LLM for the rest; llm = LLM first
-BRAIN_PROVIDERS = ("claude", "ollama")
+BRAIN_PROVIDERS = ("gemini", "groq", "openrouter", "ollama", "claude")
 
 
 def _tool(name, desc, props=None, required=None):
@@ -2577,7 +3979,8 @@ BRAIN_TOOLS = [
                       "Never for passing remarks, tasks, or secrets such as passwords, PINs and card numbers.",
           {"text": _S, "kind": {"type": "string", "enum": ["preference", "routine", "person", "fact"]}}, ["text"]),
     _tool("forget", "Forget something about the user that they asked you to forget.", {"text": _S}),
-    _tool("command", "Run any other PAC command by its exact phrase. Known phrases: 'list contacts', 'list messages', "
+    _tool("command", "Run any other PAC command by its exact phrase. Known phrases: 'read and auto reply whatsapp', "
+                     "'turn on whatsapp auto reply', 'turn off whatsapp auto reply', 'list contacts', 'list messages', "
                      "'change voice', 'speak faster', 'speak slower', 'start gestures', 'stop gestures', 'who is there', "
                      "'what is my schedule tomorrow', 'open my facts', 'review my mail', 'flip a coin', 'roll a dice', "
                      "'help', 'text mode', 'voice mode', 'start file transfer', 'stop file transfer', 'grab file', 'drop file'.", {"phrase": _S}),
@@ -2773,9 +4176,79 @@ def brain_decide(cfg, history, timeout=20, memory_block=""):
     can_remember = bool(cfg.get("memory_enabled", True))
     system = brain_system_prompt(memory_block, can_remember)
     tools = [t for t in BRAIN_TOOLS if can_remember or t["name"] not in ("remember", "forget")]
-    if cfg.get("brain_provider", "claude") == "ollama":
+    prov = cfg.get("brain_provider", "ollama")
+
+    if prov == "gemini":
+        key = gemini_key_get(cfg)
+        if not key:
+            raise ClaudeError("no Google Gemini API key set", "no_key")
+        model = (cfg.get("gemini_model") or GEMINI_MODELS[0][0]).strip()
+        contents = []
+        for m in history:
+            role = "model" if m.get("role") == "assistant" else "user"
+            contents.append({"role": role, "parts": [{"text": str(m.get("content", ""))}]})
+        fn_decls = [{"name": t["name"], "description": t["description"], "parameters": t["parameters"]} for t in tools]
+        body = {
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": contents,
+            "tools": [{"functionDeclarations": fn_decls}],
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 400},
+        }
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{quote(model)}:generateContent?key={quote(key)}"
+        data = _post_json(url, body, {"content-type": "application/json"}, timeout)
+        cands = data.get("candidates") or []
+        parts = ((cands[0].get("content") or {}).get("parts") or []) if cands else []
+        for p in parts:
+            fc = p.get("functionCall")
+            if fc and fc.get("name"):
+                return fc["name"], fc.get("args") or {}
+        text = "".join(p.get("text", "") for p in parts if "text" in p).strip()
+        if not text:
+            raise ClaudeError("Gemini sent back an empty reply", "error")
+        return "reply", {"text": re.sub(r"[*_#`]+", "", text)}
+
+    if prov in ("groq", "openrouter"):
+        if prov == "groq":
+            key = groq_key_get(cfg)
+            if not key:
+                raise ClaudeError("no Groq API key set", "no_key")
+            url = "https://api.groq.com/openai/v1/chat/completions"
+            model = cfg.get("groq_model") or GROQ_MODELS[0][0]
+            headers = {"content-type": "application/json", "authorization": f"Bearer {key}", "user-agent": "PAC-Assistant/1.0"}
+        else:
+            key = openrouter_key_get(cfg)
+            if not key:
+                raise ClaudeError("no OpenRouter API key set", "no_key")
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            model = cfg.get("openrouter_model") or OPENROUTER_MODELS[0][0]
+            headers = {"content-type": "application/json", "authorization": f"Bearer {key}", "http-referer": "https://github.com/ECZA1069/Pac-voice-assistant"}
+        body = {
+            "model": model,
+            "messages": [{"role": "system", "content": system}] + history,
+            "tools": [{"type": "function", "function": t} for t in tools],
+            "max_tokens": 400,
+        }
+        data = _post_json(url, body, headers, timeout)
+        choices = data.get("choices") or []
+        msg = (choices[0].get("message") or {}) if choices else {}
+        calls = msg.get("tool_calls") or []
+        if calls:
+            fn = calls[0].get("function") or {}
+            args = fn.get("arguments") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    args = {}
+            return fn.get("name", ""), args
+        text = (msg.get("content") or "").strip()
+        if not text:
+            raise ClaudeError("the AI model sent back nothing", "error")
+        return "reply", {"text": re.sub(r"[*_#`]+", "", text)}
+
+    if prov == "ollama":
         base = (cfg.get("ollama_url") or "http://localhost:11434").rstrip("/")
-        body = {"model": cfg.get("ollama_model") or "llama3.1:8b", "stream": False,
+        body = {"model": cfg.get("ollama_model") or "qwen2.5:3b", "stream": False,
                 "messages": [{"role": "system", "content": system}] + history,
                 "tools": [{"type": "function", "function": t} for t in tools]}
         data = _post_json(base + "/api/chat", body, {"content-type": "application/json"}, max(timeout, 60))
@@ -6930,10 +8403,35 @@ class Assistant:
         self.faces = None                     # the FaceEngine, set by the window
         self.ar = None                        # the ARVision engine, set by the window
         self._last_greet = {}                 # face key -> when "welcome back" was last said
+        self.msg_perms = {                    # session permissions & mode
+            "wa_read_reply": True,            # enabled so WhatsApp read & auto-reply works immediately
+            "gmail_read_reply": False,
+            "test_mode": False,               # Live WhatsApp mode by default (say 'test mode on' for simulator)
+            "exclude_groups": True,           # strictly exclude WhatsApp groups & Gmail group/bulk threads
+        }
+        self.wa_auto_reply_on = bool(cfg.get("wa_auto_reply", True))
+        self._wa_replied_ids = _load_wa_replied_ids()  # message IDs already auto-replied to (persisted on disk)
+        self._wa_auto_lock = threading.Lock()
+        self.wa_test_inbox = [dict(x) for x in DEFAULT_TEST_WA_MESSAGES]
+        self.gmail_test_inbox = [dict(x) for x in DEFAULT_TEST_GMAIL_MESSAGES]
+        self.wa_last_direct = []
+        self.gmail_last_direct = []
+        threading.Thread(target=self._wa_auto_reply_loop, daemon=True).start()
         C = lambda p, fn: (re.compile(p), fn)
         self.commands = [
             C(STOP_SPEAKING.pattern, self.c_stop),
             C(HOME_RE.pattern, self.c_home),
+            C(r"^(?:grant|allow|enable|give)\s+(?:the\s+)?(?:temporary\s+|session\s+)?(?P<ch>whatsapp|gmail|mail|email|message|messaging|all)?\s*(?:read(?:\s+and\s+reply)?\s+)?permissions?(?:\s+for\s+(?:now|the\s+time\s+being|this\s+session))?$", self.c_msg_perm_grant),
+            C(r"^(?:revoke|remove|disable|deny)\s+(?:the\s+)?(?P<ch>whatsapp|gmail|mail|email|message|messaging|all)?\s*(?:read(?:\s+and\s+reply)?\s+)?permissions?$", self.c_msg_perm_revoke),
+            C(r"^(?:switch\s+to|enable|turn\s+on|use|start)\s+(?:message\s+|whatsapp\s+|gmail\s+)?(?:test|sandbox|simulation|simulator)\s+mode$|^test\s+mode\s+on$", self.c_msg_test_mode_on),
+            C(r"^(?:switch\s+to|enable|turn\s+on|use|go\s+to)\s+live\s+(?:whatsapp|gmail|message|messaging)(?:\s+mode)?$|^live\s+mode\s+on$|^test\s+mode\s+off$", self.c_msg_live_mode_on),
+            C(r"^(?:open|show)\s+(?:the\s+)?(?:message|messaging|whatsapp|gmail|smart\s+reply|auto[- ]?reply)\s+(?:permissions?|test\s+lab|sandbox|simulator|console)$", self.c_msg_lab_open),
+            C(r"^reset\s+(?:the\s+)?(?:test|sandbox|simulated)\s+(?:messages?|inbox|whatsapp|gmail)$", self.c_msg_test_reset),
+            C(r"^(?:(?P<on>turn on|enable|start|activate|switch on)|(?P<off>turn off|disable|stop|deactivate|switch off))\s+(?:the\s+)?(?:whatsapp\s+)?auto[- ]?reply(?:\s+(?:on\s+whatsapp|for\s+whatsapp|mode))?$|^whatsapp\s+auto[- ]?reply\s+(?P<st>on|off)$|^auto[- ]?reply\s+(?:whatsapp\s+)?(?P<st2>on|off)$", self.c_wa_auto_reply_toggle),
+            C(r"^simulate\s+(?:a\s+|an\s+)?(?:incoming\s+)?whatsapp(?:\s+message)?\s+from\s+(?P<who>.+?)\s+(?:saying|that|with\s+text|message)\s+(?P<txt>.+)$", self.c_wa_simulate_msg),
+            C(r"^(?:review|choose|pick)\s+(?:my\s+)?whatsapp\s+(?:replies|options|messages\s+manually)$", self.c_wa_read_reply),
+            C(r"^(?:(?:auto[- ]?reply|automatically\s+reply)(?:\s+to)?(?:\s+my|\s+the|\s+all|\s+unread|\s+latest|\s+new)*\s+whatsapp(?:\s+(?:messages?|chats?|inbox|notifications?))?|(?:check|read|show|get|fetch|review|scan|test)(?: me)?(?: my| the| all| any)*(?: new| unread| latest| incoming| test| simulated)*\s+whatsapp(?:\s+(?:messages?|chats?|inbox|notifications?))?(?:\s+(?:and\s+)?(?:auto[- ]?reply|reply(?:\s+back)?(?:\s+automatically|\s+accordingly)?|send\s+(?:a\s+)?reply|suggest\s+replies|with\s+prebuilt\s+replies))?|do i have (?:any )?(?:new |unread )?whatsapp(?:\s+messages?)?|any (?:new |unread )?whatsapp(?:\s+messages?)?|read(?:\s+and\s+(?:auto[- ]?)?reply\s+to)?\s+whatsapp|reply\s+(?:back\s+)?to\s+(?:my\s+)?whatsapp(?:\s+(?:messages?|automatically|accordingly))?)$", self.c_wa_auto_read_reply),
+            C(r"^(?:(?:read|check|review|test)(?: me)?(?: my| the| all| any)?(?: new| unread| latest| incoming| test| simulated)*\s+(?:gmail|e-?mails?|mails?)\s+(?:and\s+(?:reply|suggest\s+replies|give\s+prebuilt\s+replies)|with\s+(?:prebuilt\s+|smart\s+)?replies)|smart\s+reply\s+(?:to\s+)?(?:my\s+)?(?:gmail|e-?mails?|mails?)|reply\s+to\s+(?:my\s+)?(?:unread\s+|latest\s+|new\s+)?(?:gmail|e-?mails?|mails?)|read\s+(?:my\s+)?gmail(?:\s+messages?)?|test\s+(?:my\s+)?(?:gmail|e-?mail)\s+(?:messages?|replies))$", self.c_mail_read_reply),
             C(r"^(?:please )?(?:enrol|enroll|register|remember|learn|save|add|scan)\s+(?:my |a |this |the |new |another )?face(?:\s+(?:as|for|named|called)\s+(?P<n>[a-z][a-z' -]*?))?(?:\s+as\s+(?P<r>owner|trusted|guest|family))?$", self.c_face_enroll),
             C(r"^(?:forget|delete|remove|erase)\s+(?:all |the |my )?faces?(?:\s+(?:of|for|named|called))?\s*(?P<n>[a-z][a-z' -]*)?$", self.c_face_forget),
             C(r"^(?:who(?:'s| is| are)(?: there| here| around| in front of (?:me|you|the (?:laptop|camera|screen))| at the (?:laptop|camera|screen))|who (?:do you see|can you see)|do you see (?:anyone|anybody|someone)|is (?:anyone|anybody|someone) (?:there|here|around)|look around)$", self.c_face_who),
@@ -6957,7 +8455,10 @@ class Assistant:
             C(r"^(?:set up|setup|add|load|install)\s+(?:the )?(?:ar )?(?:starter|default|preset|predefined) (?:shape )?(?:commands|pack|actions)$", self.c_ar_starter),
             C(r"^(?:give me |tell me |read |read out |show |what(?:'s| is) )?(?:me )?(?:the )?(?:today'?s |latest |top )*(?:(?P<n>\d+|five|ten|fifteen|twenty) )?(?:international |world |global )?(?:news|headlines)(?: today)?$", self.c_news),
             C(r"^(?:set |switch to |use |turn )?(?:the )?(?:ai )?brain(?: mode)?\s*(?:to |is )?(?P<m>llm|hybrid|rules|off|on)$", self.c_brain),
-            C(r"^(?:use|switch to|set)\s+(?P<p>ollama|claude)(?: as)?(?: the)? brain$|^brain (?:provider )?(?P<p2>ollama|claude)$", self.c_brain),
+            C(r"^(?:use|switch to|set)\s+(?P<p>gemini|groq|openrouter|ollama|claude)(?: as)?(?: the)?(?: ai)? brain$|^brain (?:provider )?(?P<p2>gemini|groq|openrouter|ollama|claude)$", self.c_brain),
+            C(r"^(?:open|show|configure|set up|setup)\s+(?:the\s+)?(?:google\s+)?(?:gemini|groq|openrouter|free\s+ai|ai\s+models?|ai\s+keys?)(?:\s+(?:setup|settings?|api\s+keys?|config))?$|^(?:gemini|groq|openrouter|free\s+ai)\s+setup$", self.c_ai_setup_open),
+            C(r"^(?:use|switch to|set)\s+(?:google\s+)?(?P<wp>gemini|groq|openrouter|ollama|claude|free(?:\s+ai)?|auto)\s+(?:for|on|in)\s+whatsapp(?:\s+auto[- ]?reply)?$", self.c_wa_ai_provider),
+            C(r"^(?:(?:ask|tell|hey|ok|okay) gemini(?: to| that)?|gemini)\s+(?P<q>.+)$", self.c_gemini_ask),
             C(r"^(?:pair|connect|link)\s+(?:with\s+)?(?:my |the )?phone(?: with (?:a )?(?:qr|code))?$|^(?:show|open)\s+(?:the )?(?:phone )?qr(?: code)?$", self.c_pair_qr),
             C(r"^(?:unpair|unlink|forget)\s+(?:my |the )?phone$", self.c_unpair_phone),
             C(r"^(?:start|turn on|enable|begin|open)\s+(?:the )?(?:phone |file )?(?:file )?transfer$", self.c_transfer_on),
@@ -7340,9 +8841,70 @@ class Assistant:
     def brain_active(self):
         if self.cfg.get("brain", "hybrid") == "rules":
             return False
-        if self.cfg.get("brain_provider", "claude") == "ollama":
+        prov = self.cfg.get("brain_provider", "ollama")
+        if prov == "ollama":
             return True
+        if prov == "gemini":
+            return bool(gemini_key_get(self.cfg))
+        if prov == "groq":
+            return bool(groq_key_get(self.cfg))
+        if prov == "openrouter":
+            return bool(openrouter_key_get(self.cfg))
         return bool(claude_key_get(self.cfg))        # Claude brain only works once you've given a key
+
+    def c_ai_setup_open(self, m, t):
+        self.notify("ai_setup", None)
+        self.say("I've opened the Google Gemini and Free AI setup window.")
+
+    def c_wa_ai_provider(self, m, t):
+        wp = (m.group("wp") or "auto").strip().lower()
+        if wp.startswith("free"):
+            wp = "free"
+        self.cfg["wa_ai_provider"] = wp
+        save_config(self.cfg)
+        summary = active_wa_ai_summary(self.cfg)
+        self.emit("sys", f"WhatsApp Auto-Reply AI Engine: {summary}")
+        if wp == "gemini" and not gemini_key_get(self.cfg):
+            self.notify("ai_setup", None)
+            self.say("WhatsApp auto-reply set to Google Gemini. Please paste your Gemini API key in the setup box I just opened.")
+        elif wp == "groq" and not groq_key_get(self.cfg):
+            self.notify("ai_setup", None)
+            self.say("WhatsApp auto-reply set to Groq. Please paste your free Groq API key in the setup box I just opened.")
+        elif wp == "openrouter" and not openrouter_key_get(self.cfg):
+            self.notify("ai_setup", None)
+            self.say("WhatsApp auto-reply set to OpenRouter. Please paste your free OpenRouter API key in the setup box I just opened.")
+        else:
+            self.say(f"WhatsApp auto-reply AI engine set to {wp}.")
+
+    def c_gemini_ask(self, m, t):
+        q = (m.group("q") or "").strip()
+        if not q:
+            return False
+        key = gemini_key_get(self.cfg)
+        if not key:
+            self.say("I need your Google Gemini API key first. I've opened the Gemini and Free AI setup box.")
+            self.notify("ai_setup", None)
+            return
+        self.emit("sys", "(asking Google Gemini...)")
+        try:
+            reply = ask_gemini(key, self.cfg.get("gemini_model") or GEMINI_MODELS[0][0],
+                               [{"role": "user", "content": q}],
+                               system_extra=self._mem_block(q, cloud=True))
+        except ClaudeError as e:
+            logger.warning("gemini request failed: %s", e)
+            if e.kind in ("auth", "no_key"):
+                self.say(f"Sorry, {e}. Please check the key in the Gemini setup box.")
+                self.notify("ai_setup", None)
+            else:
+                self.say(f"Sorry, {e}.")
+            return
+        if len(reply) > 350:
+            cut = reply[:350].rsplit(". ", 1)[0].rstrip(".") + "."
+            self.emit("pac", reply)
+            self.last_reply = reply
+            self._speak(self._sirify(cut))
+        else:
+            self.say(reply)
 
     def brain_route(self, raw, t, source="voice"):
         """Send the sentence to the model, then run what it chose. Returns True when handled; False means the
@@ -7419,6 +8981,24 @@ class Assistant:
             self.brain_history = []
             if prov == "ollama":
                 self.say("Brain set to your local Ollama model. Nothing leaves this laptop.")
+            elif prov == "gemini":
+                if gemini_key_get(self.cfg):
+                    self.say("Brain set to Google Gemini.")
+                else:
+                    self.say("Brain set to Google Gemini, but I need your API key first. I've opened the setup box for it.")
+                    self.notify("ai_setup", None)
+            elif prov == "groq":
+                if groq_key_get(self.cfg):
+                    self.say("Brain set to Groq Free AI.")
+                else:
+                    self.say("Brain set to Groq, but I need your free Groq API key first. I've opened the setup box for it.")
+                    self.notify("ai_setup", None)
+            elif prov == "openrouter":
+                if openrouter_key_get(self.cfg):
+                    self.say("Brain set to OpenRouter Free AI.")
+                else:
+                    self.say("Brain set to OpenRouter, but I need your free OpenRouter API key first. I've opened the setup box for it.")
+                    self.notify("ai_setup", None)
             elif claude_key_get(self.cfg):
                 self.say("Brain set to Claude. What you say goes to Anthropic's servers.")
             else:
@@ -7433,7 +9013,7 @@ class Assistant:
                  "hybrid": "Hybrid brain. I try my built-in commands first, then the AI for everything else.",
                  "llm": "Full AI brain. The AI understands every sentence first."}
         self.say(names[mode] + ("" if mode == "rules" or self.brain_active() else
-                                " It won't work until you add a Claude key or say 'use ollama brain'."))
+                                " It won't work until you add an API key or say 'use ollama brain'."))
 
     def answer_offline_first(self, t):
         """In full-AI mode your own notes/facts still win, but only for a clear question."""
@@ -8385,25 +9965,36 @@ class Assistant:
         if not 1 <= n <= len(msgs):
             self.say(f"I only have {len(msgs)} preloaded messages. Say list messages to hear them.")
             return
-        who = self.resolve_contact(m["who"])
-        if not who:
-            self.say(f"I couldn't find {m['who']} in your contacts. Add them with the Contacts button.")
-            return
-        self.confirm_whatsapp(who[0], who[1], msgs[n - 1])
+        raw_who = re.sub(r"^(?:my|the)\s+", "", m["who"].strip())
+        who = self.resolve_contact(raw_who)
+        if who:
+            self.confirm_whatsapp(who[0], who[1], msgs[n - 1])
+        else:
+            # Works even without a predefined phone number by searching the chat name in WhatsApp
+            self.confirm_whatsapp(raw_who, "", msgs[n - 1])
 
     def c_wa_compose(self, m, t):
         rest = m["rest"].strip()
         found = self.find_contact_prefix(rest)
-        if not found:
-            self.say("I couldn't find that contact. Add them with the Contacts button first.")
-            return
-        name, number, body = found
-        body = re.sub(r"^(?:saying|say|that|to say|says)\s+", "", body).strip()
+        if found:
+            name, number, body = found
+            body = re.sub(r"^(?:saying|say|that|to say|says)\s+", "", body).strip()
+        else:
+            # No predefined phone number required: split "<name> saying <message>" and search by chat name in WhatsApp
+            m_say = re.match(r"^(?P<who>.+?)\s+(?:saying|say|that|to say|says)\s+(?P<body>.+)$", rest, re.I)
+            if m_say:
+                name = re.sub(r"^(?:my|the)\s+", "", m_say.group("who").strip())
+                number = ""
+                body = m_say.group("body").strip()
+            else:
+                name = re.sub(r"^(?:my|the)\s+", "", rest)
+                number = ""
+                body = ""
         if body:
             self.confirm_whatsapp(name, number, polish(body))
         else:
             self.say(f"What should I say to {name}?")
-            self.awaiting = lambda text: self.confirm_whatsapp(name, number, text)
+            self.awaiting = lambda text: self.confirm_whatsapp(name, number, polish(text))
 
     def confirm_whatsapp(self, name, number, message):
         def go():
@@ -8413,23 +10004,39 @@ class Assistant:
         else:
             go()
 
-    def send_whatsapp(self, name, number, message):
+    def send_whatsapp(self, name, number, message, auto=False):
+        wait_secs = float(self.cfg.get("wa_delay", 4 if auto else 7))
+        if not number:
+            # Send directly by searching `name` inside WhatsApp (requires NO predefined phone number)
+            self.say(f"Auto-replying on WhatsApp to {name}: {message}" if auto else
+                     f"Opening WhatsApp for {name}. Please don't touch the keyboard for a few seconds.")
+            send_whatsapp_by_chat_name(name, message, wait_secs=wait_secs)
+            self.say(f"Message sent to {name}.")
+            return
         text = quote(message)
         if OS == "Windows" and not protocol_registered("whatsapp"):
             webbrowser.open(f"https://web.whatsapp.com/send?phone={number}&text={text}")
-            self.say(f"WhatsApp isn't installed, so I opened WhatsApp Web with your message to {name}. "
-                     "Press Enter to send it.")
+            time.sleep(wait_secs)
+            pyautogui.press("enter")
+            self.say(f"Message sent to {name}.")
             return
         url = f"whatsapp://send?phone={number}&text={text}"
         try:
             open_path(url) if OS != "Windows" else os.startfile(url)  # type: ignore[attr-defined]
         except Exception:
             webbrowser.open(f"https://wa.me/{number}?text={text}")
-            self.say("I opened WhatsApp in your browser. Press the send button to finish.")
+            time.sleep(wait_secs)
+            pyautogui.press("enter")
+            self.say(f"Message sent to {name}.")
             return
-        self.say(f"Opening WhatsApp for {name}. Please don't touch the keyboard for a few seconds.")
-        time.sleep(float(self.cfg.get("wa_delay", 7)))
+        self.say(f"Auto-replying on WhatsApp to {name}: {message}" if auto else
+                 f"Opening WhatsApp for {name}. Please don't touch the keyboard for a few seconds.")
+        _wait_for_wa_compose_ready(min_wait=2.2, max_wait=max(3.5, wait_secs))
+        _focus_whatsapp_window()
         pyautogui.press("enter")
+        time.sleep(1.1)
+        if auto:
+            _unfocus_whatsapp_after_auto()
         self.say(f"Message sent to {name}.")
 
     def c_list_messages(self, m, t):
@@ -8444,7 +10051,361 @@ class Assistant:
             self.emit("sys", "Contacts: " + ", ".join(names))
             self._speak(f"You have {len(names)} contacts: " + ", ".join(names[:8]))
         else:
-            self.say("You have no contacts yet. Use the Contacts button to add some.")
+            self.say("You have no saved contact numbers. PAC can still message or auto-reply on WhatsApp by chat name without predefined numbers.")
+
+    # ---------- WhatsApp Auto-Read & Contextual Auto-Reply + Gmail Smart Reply
+    def _require_msg_perm(self, channel, on_granted):
+        """Check session permission before reading/replying to WhatsApp or Gmail."""
+        key = "wa_read_reply" if channel == "wa" else "gmail_read_reply"
+        label = "WhatsApp" if channel == "wa" else "Gmail"
+        if self.msg_perms.get(key):
+            on_granted()
+            return
+        mode_tag = "Sandbox Test Mode (safe simulation)" if self.msg_perms.get("test_mode", False) else "Live Mode"
+
+        def grant_and_run():
+            self.msg_perms[key] = True
+            self.notify("msg_perms_updated", dict(self.msg_perms))
+            self.emit("sys", f"[PERMISSION GRANTED — SESSION ONLY] {label} 1-on-1 read & reply enabled "
+                             f"({mode_tag}; groups are strictly ignored).")
+            on_granted()
+
+        self.emit("sys", f"Permission required ({label}): PAC asks permission before reading "
+                         f"your 1-on-1 {label} messages and replying. "
+                         f"Group chats/group emails are never read or replied to. Current mode: {mode_tag}.")
+        self.ask(f"Do I have your permission to read your 1-on-1 {label} messages and reply "
+                 f"in {mode_tag}? Group messages are strictly excluded. Say yes or no.",
+                 grant_and_run)
+
+    def c_msg_perm_grant(self, m, t):
+        ch = (m.groupdict().get("ch") or "all").lower()
+        if ch in ("whatsapp",):
+            self.msg_perms["wa_read_reply"] = True
+            what = "WhatsApp"
+        elif ch in ("gmail", "mail", "email"):
+            self.msg_perms["gmail_read_reply"] = True
+            what = "Gmail"
+        else:
+            self.msg_perms["wa_read_reply"] = True
+            self.msg_perms["gmail_read_reply"] = True
+            what = "WhatsApp and Gmail"
+        self.notify("msg_perms_updated", dict(self.msg_perms))
+        mode_lbl = "Sandbox Test Mode" if self.msg_perms.get("test_mode", False) else "Live Mode"
+        self.say(f"Permission granted for {what} in {mode_lbl}. "
+                 "Group chats and group emails are strictly ignored.")
+
+    def c_msg_perm_revoke(self, m, t):
+        ch = (m.groupdict().get("ch") or "all").lower()
+        if ch in ("whatsapp",):
+            self.msg_perms["wa_read_reply"] = False
+            what = "WhatsApp"
+        elif ch in ("gmail", "mail", "email"):
+            self.msg_perms["gmail_read_reply"] = False
+            what = "Gmail"
+        else:
+            self.msg_perms["wa_read_reply"] = False
+            self.msg_perms["gmail_read_reply"] = False
+            what = "WhatsApp and Gmail"
+        self.notify("msg_perms_updated", dict(self.msg_perms))
+        self.say(f"Permission revoked for {what}. I won't read or reply until you allow it again.")
+
+    def c_msg_test_mode_on(self, m, t):
+        self.msg_perms["test_mode"] = True
+        self.notify("msg_perms_updated", dict(self.msg_perms))
+        self.say("Sandbox Test Mode is on. We can test reading 1-on-1 WhatsApp messages and auto-replying "
+                 "safely without touching your live WhatsApp.")
+
+    def c_msg_live_mode_on(self, m, t):
+        self.msg_perms["test_mode"] = False
+        self.notify("msg_perms_updated", dict(self.msg_perms))
+        self.say("Live mode is now active for WhatsApp and Gmail. Group chats and group emails remain strictly excluded.")
+
+    def c_msg_lab_open(self, m, t):
+        self.notify("msg_lab_open", None)
+        self.say("Opening the WhatsApp Auto-Reply and Smart Reply Console.")
+
+    def c_msg_test_reset(self, m, t):
+        self.wa_test_inbox = [dict(x) for x in DEFAULT_TEST_WA_MESSAGES]
+        self.gmail_test_inbox = [dict(x) for x in DEFAULT_TEST_GMAIL_MESSAGES]
+        self._wa_replied_ids.clear()
+        _save_wa_replied_ids(self._wa_replied_ids)
+        self.notify("msg_perms_updated", dict(self.msg_perms))
+        self.say("Simulated WhatsApp and Gmail test messages have been reset.")
+
+    def c_wa_auto_reply_toggle(self, m, t):
+        gd = m.groupdict()
+        want_on = bool(gd.get("on") or gd.get("st") == "on" or gd.get("st2") == "on")
+        self.set_wa_auto_reply(want_on, announce=True)
+
+    def set_wa_auto_reply(self, on, announce=True):
+        on = bool(on)
+        self.wa_auto_reply_on = on
+        self.cfg["wa_auto_reply"] = on
+        save_config(self.cfg)
+        if on:
+            self.msg_perms["wa_read_reply"] = True
+        self.notify("wa_auto_state", on)
+        self.notify("msg_perms_updated", dict(self.msg_perms))
+        if announce:
+            if on:
+                mode_lbl = "Sandbox Test Mode" if self.msg_perms.get("test_mode", False) else "Live WhatsApp Mode"
+                self.say(f"WhatsApp Auto-Reply is now ON in {mode_lbl}. I will read incoming 1-on-1 WhatsApp messages "
+                         "and automatically send back a contextual reply. Group chats are ignored.")
+                threading.Thread(target=lambda: self._wa_run_auto_read_reply(quiet_if_empty=True), daemon=True).start()
+            else:
+                self.say("WhatsApp Auto-Reply mode is now OFF.")
+
+    def _wa_auto_reply_loop(self):
+        """Background watcher: when WhatsApp Auto-Reply mode is enabled, checks every 2 seconds for new incoming
+        1-on-1 WhatsApp messages, reads what was sent, and replies back accordingly."""
+        while True:
+            time.sleep(2.0)
+            if not self.wa_auto_reply_on or self.asleep:
+                continue
+            try:
+                self._wa_run_auto_read_reply(quiet_if_empty=True)
+            except Exception:
+                logger.exception("wa auto reply loop error")
+
+    def c_wa_simulate_msg(self, m, t):
+        """Simulate an incoming 1-on-1 WhatsApp message from any sender name with zero predefined numbers,
+        then immediately read what was sent and auto-reply accordingly."""
+        who = m.group("who").strip()
+        txt = m.group("txt").strip()
+        sim_msg = {
+            "id": f"wa_sim_custom_{int(time.time() * 1000)}",
+            "sender": who,
+            "number": "",
+            "chat_title": who,
+            "text": txt,
+            "is_group": False,
+            "participants": 2,
+            "time": "Just now",
+        }
+        is_grp, reason = is_whatsapp_group(sim_msg)
+        sim_msg["is_group"] = is_grp
+        sim_msg["group_reason"] = reason
+        if is_grp:
+            self.emit("sys", f"[NO-GROUPS RULE • WHATSAPP] Ignored simulated group message from {who} ({reason}).")
+            self.say(f"Ignored group chat message from {who}.")
+            return
+        self._wa_process_single_auto_reply(sim_msg, test_mode=bool(self.msg_perms.get("test_mode", False)))
+
+    def c_wa_auto_read_reply(self, m, t):
+        """Read incoming 1-on-1 WhatsApp messages and automatically send back a contextual reply for each."""
+        self.msg_perms["wa_read_reply"] = True
+        threading.Thread(target=lambda: self._wa_run_auto_read_reply(quiet_if_empty=False), daemon=True).start()
+
+    def _wa_run_auto_read_reply(self, quiet_if_empty=False):
+        if not self._wa_auto_lock.acquire(blocking=False):
+            return
+        try:
+            test_mode = bool(self.msg_perms.get("test_mode", False))
+            if test_mode:
+                raw_msgs = list(self.wa_test_inbox)
+                src_label = "SANDBOX TEST MODE"
+            else:
+                raw_msgs = fetch_incoming_whatsapp_messages(
+                    self.cfg,
+                    max_age_secs=7200 if quiet_if_empty else None,
+                )
+                src_label = "LIVE WHATSAPP"
+            direct_msgs, skipped_groups = [], []
+            for msg in raw_msgs:
+                mid = msg.get("id") or f"{msg.get('sender')}|{msg.get('text')}"
+                if mid in self._wa_replied_ids:
+                    continue
+                is_grp, reason = is_whatsapp_group(msg)
+                if is_grp:
+                    skipped_groups.append((msg.get("chat_title") or msg.get("sender") or "Group", reason))
+                    self._wa_replied_ids.add(mid)
+                    _save_wa_replied_ids(self._wa_replied_ids)
+                else:
+                    direct_msgs.append(msg)
+            if skipped_groups and not quiet_if_empty:
+                grp_summary = ", ".join(f"{name} ({why})" for name, why in skipped_groups)
+                self.emit("sys", f"[NO-GROUPS RULE • WHATSAPP] Excluded {len(skipped_groups)} group chat message(s): {grp_summary}")
+            self.wa_last_direct = direct_msgs
+            if not direct_msgs:
+                if not quiet_if_empty:
+                    if test_mode:
+                        self.say("You have no unread 1-on-1 WhatsApp test messages left. Say reset test messages to reload them.")
+                    else:
+                        self.say("No unread 1-on-1 WhatsApp messages were found right now. "
+                                 "Make sure WhatsApp notifications are enabled on Windows, or say simulate whatsapp from Rahul saying hello.")
+                return
+            if not quiet_if_empty and len(direct_msgs) > 1:
+                self.say(f"Reading {len(direct_msgs)} incoming 1-on-1 WhatsApp messages in {src_label.lower()} and replying automatically.")
+            for idx, msg in enumerate(direct_msgs, 1):
+                self._wa_process_single_auto_reply(msg, test_mode=test_mode, idx=idx, total=len(direct_msgs))
+        finally:
+            self._wa_auto_lock.release()
+
+    def _wa_process_single_auto_reply(self, msg, test_mode=False, idx=1, total=1):
+        """Read a single incoming 1-on-1 WhatsApp message, generate a contextual reply based on what was sent,
+        and automatically send the reply back on WhatsApp (no predefined phone numbers required)."""
+        is_grp, reason = is_whatsapp_group(msg)
+        if is_grp:
+            return
+        mid = msg.get("id") or f"{msg.get('sender')}|{msg.get('text')}"
+        self._wa_replied_ids.add(mid)
+        _save_wa_replied_ids(self._wa_replied_ids)
+        sender = str(msg.get("sender") or "Contact").strip()
+        incoming_text = str(msg.get("text") or "").strip()
+        reply_text = generate_whatsapp_auto_reply(
+            sender,
+            incoming_text,
+            preloaded=self.cfg.get("messages"),
+            cfg=self.cfg,
+            use_ai=True,
+        )
+        mode_badge = "TEST MODE (Safe Simulator)" if test_mode else "LIVE WHATSAPP AUTO-REPLY"
+        log_lines = [
+            f"[WHATSAPP AUTO-READ & REPLY • {mode_badge}] ({idx}/{total}) From {sender}:",
+            f"  Incoming Message Read: \"{incoming_text}\"",
+            f"  Contextual Auto-Reply: \"{reply_text}\"",
+        ]
+        self.emit("sys", "\n".join(log_lines))
+        self.say(f"WhatsApp message from {sender}: {incoming_text}.")
+        if test_mode:
+            self.wa_test_inbox = [x for x in self.wa_test_inbox if x.get("id") != msg.get("id")]
+            self.emit("sys", f"[TEST MODE — AUTO-REPLIED] Sent reply to {sender}: \"{reply_text}\"")
+            self.say(f"Auto-replied to {sender}: {reply_text}")
+            self.notify("msg_perms_updated", dict(self.msg_perms))
+            return
+        # Resolve number if extracted from WhatsApp LevelDB, user contacts, or sender title; otherwise empty string (sends by chat name)
+        who = self.resolve_contact(sender)
+        raw_num = msg.get("number") or (who[1] if who else "") or _extract_sender_phone_if_present(sender)
+        number = self.normalize_number(raw_num) if raw_num else ""
+        self.send_whatsapp(sender, number, reply_text, auto=True)
+        self.emit("sys", f"[LIVE WHATSAPP — AUTO-REPLIED] Sent reply to {sender}: \"{reply_text}\"")
+
+    def c_wa_read_reply(self, m, t):
+        self._require_msg_perm("wa", self._wa_start_read_reply)
+
+    def _wa_start_read_reply(self):
+        test_mode = bool(self.msg_perms.get("test_mode", False))
+        if test_mode:
+            raw_msgs = list(self.wa_test_inbox)
+            src_label = "SANDBOX TEST MODE"
+        else:
+            raw_msgs = fetch_incoming_whatsapp_messages(self.cfg)
+            src_label = "LIVE WHATSAPP"
+        direct_msgs, skipped_groups = [], []
+        for msg in raw_msgs:
+            is_grp, reason = is_whatsapp_group(msg)
+            if is_grp:
+                skipped_groups.append((msg.get("chat_title") or msg.get("sender") or "Group", reason))
+            else:
+                direct_msgs.append(msg)
+        if skipped_groups:
+            grp_summary = ", ".join(f"{name} ({why})" for name, why in skipped_groups)
+            self.emit("sys", f"[NO-GROUPS RULE • WHATSAPP] Excluded {len(skipped_groups)} group chat message(s): {grp_summary}")
+        self.wa_last_direct = direct_msgs
+        if not direct_msgs:
+            if test_mode:
+                self.say("You have no unread 1-on-1 WhatsApp test messages left. Say reset test messages to reload them.")
+            else:
+                self.say("You have no unread 1-on-1 WhatsApp messages right now.")
+            return
+        self.say(f"In {src_label.lower()}, you have {len(direct_msgs)} direct 1-on-1 WhatsApp "
+                 f"message{'s' if len(direct_msgs) != 1 else ''}"
+                 + (f", and I ignored {len(skipped_groups)} group chat{'s' if len(skipped_groups) != 1 else ''}." if skipped_groups else "."))
+        self._wa_step_next({"items": direct_msgs, "i": 0, "test_mode": test_mode})
+
+    def _wa_step_next(self, st):
+        items, i = st["items"], st["i"]
+        if i >= len(items):
+            self.say("That's all of your 1-on-1 WhatsApp messages.")
+            return
+        it = items[i]
+        replies = suggest_prebuilt_replies(it.get("text", ""), preloaded=self.cfg.get("messages"))
+        st["replies"] = replies
+        mode_badge = "TEST MODE (Safe Simulator)" if st.get("test_mode", False) else "LIVE WHATSAPP"
+        lines = [
+            f"[WHATSAPP 1-ON-1 • {mode_badge}] ({i + 1}/{len(items)}) From {it['sender']}:",
+            f"  Message: \"{it['text']}\"",
+            "  Suggested Prebuilt Replies:",
+        ]
+        for idx, r_txt in enumerate(replies, 1):
+            lines.append(f"    {idx}. {r_txt}")
+        lines.append("  (Say 'auto', 'reply 1', 'reply 2', 'reply 3', 'preloaded <number>', 'skip', or 'done')")
+        self.emit("sys", "\n".join(lines))
+        self.awaiting = lambda ans, st=st: self._wa_step_answer(st, ans)
+        spoken_opts = " ".join(f"Option {idx}: {r_txt}" for idx, r_txt in enumerate(replies, 1))
+        self._speak(self._sirify(
+            f"Message {i + 1} of {len(items)}, from {it['sender']}: {it['text']}. "
+            f"Prebuilt replies: {spoken_opts}. Say auto, reply 1, 2, 3, or skip."
+        ))
+
+    def _wa_step_answer(self, st, ans):
+        low = ans.lower().strip()
+        words = set(re.findall(r"[a-z0-9']+", low))
+        if words & {"done", "finish", "finished", "stop", "quit", "exit"}:
+            self.say("Okay, finished checking WhatsApp messages.")
+            return
+        if words & {"skip", "next", "pass", "no", "nope", "later", "keep"}:
+            st["i"] += 1
+            self._wa_step_next(st)
+            return
+        if words & {"repeat", "again"}:
+            self._wa_step_next(st)
+            return
+        it = st["items"][st["i"]]
+        replies = st.get("replies") or suggest_prebuilt_replies(it.get("text", ""), preloaded=self.cfg.get("messages"))
+        chosen = None
+        if words & {"auto", "automatic", "automatically"}:
+            chosen = generate_whatsapp_auto_reply(it.get("sender", ""), it.get("text", ""), preloaded=self.cfg.get("messages"), cfg=self.cfg)
+        else:
+            m_pre = re.search(r"\b(?:preloaded|preset|template)\s+(\d+|[a-z]+)\b", low)
+            if m_pre:
+                n = extract_number(m_pre.group(1))
+                msgs = self.cfg.get("messages", [])
+                if n and 1 <= n <= len(msgs):
+                    chosen = msgs[n - 1]
+                else:
+                    self.say(f"Please pick a preloaded message between 1 and {len(msgs)}.")
+                    self.awaiting = lambda a, st=st: self._wa_step_answer(st, a)
+                    return
+            else:
+                idxs = parse_indices(low)
+                if idxs and 1 <= idxs[0] <= len(replies):
+                    chosen = replies[idxs[0] - 1]
+                elif low.startswith(("say ", "custom ", "reply with ")):
+                    chosen = re.sub(r"^(?:say|custom|reply with)\s+", "", ans, flags=re.I).strip()
+        if not chosen:
+            self.say("Say auto, reply 1, reply 2, reply 3, skip, or done.")
+            self.awaiting = lambda a, st=st: self._wa_step_answer(st, a)
+            return
+
+        def advance():
+            st["i"] += 1
+            self._wa_step_next(st)
+
+        self._wa_send_prebuilt(it, chosen, test_mode=st.get("test_mode", False), on_after=advance)
+
+    def _wa_send_prebuilt(self, it, reply_text, test_mode=False, on_after=None):
+        is_grp, reason = is_whatsapp_group(it)
+        if is_grp:
+            self.say(f"Blocked: {it.get('sender', 'This chat')} is a group chat ({reason}). I never send replies to groups.")
+            if on_after:
+                on_after()
+            return
+        sender = it.get("sender", "Contact")
+        if test_mode:
+            self.wa_test_inbox = [x for x in self.wa_test_inbox if x.get("id") != it.get("id")]
+            self.emit("sys", f"[TEST MODE — NOT SENT TO LIVE WHATSAPP] Sent reply to {sender}: \"{reply_text}\"")
+            self.say(f"Test reply to {sender} recorded: {reply_text}")
+            self.notify("msg_perms_updated", dict(self.msg_perms))
+            if on_after:
+                on_after()
+            return
+        who = self.resolve_contact(sender)
+        raw_num = it.get("number") or (who[1] if who else "") or _extract_sender_phone_if_present(sender)
+        number = self.normalize_number(raw_num) if raw_num else ""
+        self.send_whatsapp(sender, number, reply_text, auto=True)
+        if on_after:
+            on_after()
 
     # ---------- notes, timers, small stuff
     def c_note(self, m, t):
@@ -8985,6 +10946,149 @@ class Assistant:
             self.say("Okay, I haven't deleted anything.")
             return
         self._confirm_trash(st["marked"])
+
+    def c_mail_read_reply(self, m, t):
+        """Read 1-on-1 Gmail messages (excluding group/mailing-list emails) and offer contextual prebuilt replies."""
+        self._require_msg_perm("gmail", self._gmail_start_read_reply)
+
+    def _gmail_start_read_reply(self):
+        test_mode = bool(self.msg_perms.get("test_mode", True))
+        if test_mode:
+            raw_mails = list(self.gmail_test_inbox)
+            src_label = "SANDBOX TEST MODE"
+        else:
+            if not self._mail_ready():
+                return
+            self.say("Checking your unread 1-on-1 Gmail messages.")
+            got = self._fetch_mail(True)
+            if got is None:
+                return
+            _, raw_mails = got
+            src_label = "LIVE GMAIL"
+        direct_mails, skipped_groups = [], []
+        for ml in raw_mails:
+            is_grp, reason = is_gmail_group(ml)
+            if is_grp:
+                skipped_groups.append((ml.get("name") or ml.get("addr") or "Group", reason))
+            else:
+                direct_mails.append(ml)
+        if skipped_groups:
+            grp_summary = ", ".join(f"{name} ({why})" for name, why in skipped_groups)
+            self.emit("sys", f"[NO-GROUPS RULE • GMAIL] Excluded {len(skipped_groups)} group/mailing-list email(s): {grp_summary}")
+        self.gmail_last_direct = direct_mails
+        if not direct_mails:
+            if test_mode:
+                self.say("You have no unread 1-on-1 Gmail test messages left. Say reset test messages to reload them.")
+            else:
+                self.say("You have no unread 1-on-1 emails right now.")
+            return
+        self.say(f"In {src_label.lower()}, you have {len(direct_mails)} direct 1-on-1 Gmail "
+                 f"message{'s' if len(direct_mails) != 1 else ''}"
+                 + (f", and I excluded {len(skipped_groups)} group or mailing-list email{'s' if len(skipped_groups) != 1 else ''}." if skipped_groups else "."))
+        self._gmail_step_next({"items": direct_mails, "i": 0, "test_mode": test_mode})
+
+    def _gmail_step_next(self, st):
+        items, i = st["items"], st["i"]
+        if i >= len(items):
+            self.say("That's all of your 1-on-1 Gmail messages.")
+            return
+        it = items[i]
+        snippet = it.get("snippet") or it.get("subject") or ""
+        replies = suggest_prebuilt_replies(snippet, it.get("subject", ""), preloaded=self.cfg.get("messages"))
+        st["replies"] = replies
+        mode_badge = "TEST MODE (Safe Simulator)" if st.get("test_mode", True) else "LIVE GMAIL"
+        lines = [
+            f"[GMAIL 1-ON-1 • {mode_badge}] ({i + 1}/{len(items)}) From {it['name']} <{it.get('addr', '')}>",
+            f"  Subject: {it['subject']}",
+            f"  Preview: \"{snippet}\"",
+            "  Suggested Prebuilt Replies:",
+        ]
+        for idx, r_txt in enumerate(replies, 1):
+            lines.append(f"    {idx}. {r_txt}")
+        lines.append("  (Say 'reply 1', 'reply 2', 'reply 3', 'preloaded <number>', 'skip', or 'done')")
+        self.emit("sys", "\n".join(lines))
+        self.awaiting = lambda ans, st=st: self._gmail_step_answer(st, ans)
+        spoken_opts = " ".join(f"Option {idx}: {r_txt}" for idx, r_txt in enumerate(replies, 1))
+        self._speak(self._sirify(
+            f"Email {i + 1} of {len(items)}, from {it['name']}. Subject: {it['subject']}. "
+            f"{snippet}. Prebuilt replies: {spoken_opts}. Say reply 1, 2, 3, or skip."
+        ))
+
+    def _gmail_step_answer(self, st, ans):
+        low = ans.lower().strip()
+        words = set(re.findall(r"[a-z0-9']+", low))
+        if words & {"done", "finish", "finished", "stop", "quit", "exit"}:
+            self.say("Okay, finished reviewing Gmail messages.")
+            return
+        if words & {"skip", "next", "pass", "no", "nope", "later", "keep"}:
+            st["i"] += 1
+            self._gmail_step_next(st)
+            return
+        if words & {"repeat", "again"}:
+            self._gmail_step_next(st)
+            return
+        it = st["items"][st["i"]]
+        replies = st.get("replies") or suggest_prebuilt_replies(it.get("snippet", ""), it.get("subject", ""), preloaded=self.cfg.get("messages"))
+        chosen = None
+        m_pre = re.search(r"\b(?:preloaded|preset|template)\s+(\d+|[a-z]+)\b", low)
+        if m_pre:
+            n = extract_number(m_pre.group(1))
+            msgs = self.cfg.get("messages", [])
+            if n and 1 <= n <= len(msgs):
+                chosen = msgs[n - 1]
+            else:
+                self.say(f"Please pick a preloaded message between 1 and {len(msgs)}.")
+                self.awaiting = lambda a, st=st: self._gmail_step_answer(st, a)
+                return
+        else:
+            idxs = parse_indices(low)
+            if idxs and 1 <= idxs[0] <= len(replies):
+                chosen = replies[idxs[0] - 1]
+            elif low.startswith(("say ", "custom ", "reply with ")):
+                chosen = re.sub(r"^(?:say|custom|reply with)\s+", "", ans, flags=re.I).strip()
+        if not chosen:
+            self.say("Say reply 1, reply 2, reply 3, skip, or done.")
+            self.awaiting = lambda a, st=st: self._gmail_step_answer(st, a)
+            return
+
+        def advance():
+            st["i"] += 1
+            self._gmail_step_next(st)
+
+        self._gmail_send_prebuilt(it, chosen, test_mode=st.get("test_mode", True), on_after=advance)
+
+    def _gmail_send_prebuilt(self, it, reply_text, test_mode=True, on_after=None):
+        is_grp, reason = is_gmail_group(it)
+        if is_grp:
+            self.say(f"Blocked: {it.get('name', 'This email')} is a group or mailing-list email ({reason}). I never send prebuilt replies to groups.")
+            if on_after:
+                on_after()
+            return
+        sender = it.get("name") or it.get("addr") or "Sender"
+        if test_mode:
+            self.gmail_test_inbox = [x for x in self.gmail_test_inbox if x.get("uid") != it.get("uid")]
+            self.emit("sys", f"[TEST MODE — NOT SENT TO LIVE GMAIL] Sent prebuilt email reply to {sender} "
+                             f"<{it.get('addr', '')}> (Re: {it.get('subject', '')}): \"{reply_text}\"")
+            self.say(f"Test Gmail reply to {sender} recorded: {reply_text}")
+            self.notify("msg_perms_updated", dict(self.msg_perms))
+            if on_after:
+                on_after()
+            return
+
+        def do_live_mail():
+            try:
+                self.mailbox.send_reply(it, reply_text)
+                self.emit("sys", f"Sent Gmail reply to {sender} <{it.get('addr', '')}>: \"{reply_text}\"")
+                self.say(f"Email reply sent to {sender}.")
+            except Exception as e:
+                self.say(self._mail_error(e))
+            if on_after:
+                on_after()
+
+        if self.cfg.get("confirm_send", True):
+            self.ask(f'Send live Gmail reply to {sender}: "{reply_text}". Shall I send it?', do_live_mail)
+        else:
+            do_live_mail()
 
     def start_timer(self, secs, message):
         tm = threading.Timer(secs, lambda: self.say(message))
@@ -12963,6 +15067,14 @@ class PacApp:
             self.ui("memory_edit")
         elif kind == "memory_state":
             self.ui("memory_state", value)
+        elif kind == "wa_auto_state":
+            self.ui("wa_auto_state", value)
+        elif kind == "msg_lab_open":
+            self.ui("msg_lab_open")
+        elif kind == "msg_perms_updated":
+            self.ui("msg_perms_updated", value)
+        elif kind == "ai_setup":
+            self.ui("ai_setup")
 
     def recognition_wanted(self):
         """Voice mode with a working microphone switch: speech goes to Google."""
@@ -13049,6 +15161,7 @@ class PacApp:
         make_pill("air", "Air Drag", lambda: self.set_air_drag(not self.airdrag_var.get()))
         make_pill("face", "Face ID", lambda: self.set_faces(not self.face_var.get()))
         make_pill("ar", "AR Vision", lambda: self.set_ar(not self.ar_var.get()))
+        make_pill("wa_auto", "WA Auto-Reply", lambda: self.toggle_wa_auto(not self.wa_auto_var.get()))
         make_pill("claude", "Claude AI", lambda: (self.claude_var.set(not self.claude_var.get()), self.toggle_claude()))
 
         self.live = tk.Label(r, text="", font=(self.F, 10, "italic"), fg=self.GREEN, bg=self.BG,
@@ -13075,6 +15188,7 @@ class PacApp:
         chips.pack(side="bottom", fill="x", padx=18, pady=(0, 6))
         tk.Label(chips, text="Quick:", font=(self.F, 9, "bold"), fg=self.RED_DIM, bg=self.BG).pack(side="left", padx=(0, 6))
         for lbl, cmd in [
+            ("WA Auto-Reply", lambda: self.submit("read and auto reply whatsapp")),
             ("Schedule", lambda: self.submit("what's my schedule today")),
             ("Battery", lambda: self.submit("battery")),
             ("Solve x\u00b2+5x+6=0", lambda: self.submit("solve x^2 + 5x + 6 = 0")),
@@ -13293,6 +15407,13 @@ class PacApp:
 
         # --- Contacts and messages
         c = sub(menu, "Contacts and messages")
+        c.add_command(label="Read & Auto-Reply WhatsApp now", command=lambda: self.submit("read and auto reply whatsapp"))
+        self.wa_auto_var = tk.BooleanVar(value=bool(self.cfg.get("wa_auto_reply", True)))
+        c.add_checkbutton(label="WhatsApp Auto-Reply mode (auto-read & reply)", variable=self.wa_auto_var,
+                          command=lambda: self.toggle_wa_auto(self.wa_auto_var.get()))
+        c.add_command(label="WhatsApp Auto-Reply Console...", command=self.msg_lab_dialog)
+        c.add_command(label="Google Gemini & Free AI Setup (API keys, models)...", command=self.ai_setup_dialog)
+        c.add_separator()
         c.add_command(label="Edit contacts...", command=self.edit_contacts)
         c.add_command(label="Import contacts from .vcf...", command=self.import_vcard)
         c.add_command(label="Edit preloaded messages...", command=self.edit_messages)
@@ -13356,6 +15477,7 @@ class PacApp:
         a.add_command(label="List voices", command=lambda: self.submit("list voices"))
         a.add_command(label="Install natural voices (edge-tts)...", command=self.install_voices_ui)
         a.add_separator()
+        a.add_command(label="Google Gemini & Free AI Setup (API keys, models)...", command=self.ai_setup_dialog)
         self.claude_var = tk.BooleanVar(value=False)       # never remembered: PAC always starts offline
         a.add_checkbutton(label="Claude mode (online - off until you switch it on)", variable=self.claude_var,
                           command=self.toggle_claude)
@@ -14750,7 +16872,8 @@ class PacApp:
             save_config(self.cfg)
             self.ui("log", "sys", f"Saved {len(contacts)} contact(s).")
         self.text_dialog("Contacts",
-                         "One per line:  name = phone number\nExample:  mom = 9876543210\n"
+                         "One per line:  name = phone number\n"
+                         "(Optional — PAC's WhatsApp Auto-Reply also works directly by chat name with no predefined numbers.)\n"
                          f"10-digit numbers get +{self.cfg.get('country_code', '91')} added automatically.",
                          "\n".join(f"{k} = {v}" for k, v in self.cfg["contacts"].items()), save)
 
@@ -14765,6 +16888,226 @@ class PacApp:
                          "One message per line. Line 1 is message 1, line 2 is message 2, and so on.\n"
                          "Say:  send message 2 to mom",
                          "\n".join(self.cfg["messages"]), save)
+
+    def toggle_wa_auto(self, on):
+        on = bool(on)
+        self.wa_auto_var.set(on)
+        self.assistant.set_wa_auto_reply(on, announce=True)
+        self._update_pills()
+
+    def ai_setup_dialog(self):
+        """Setup window for Google Gemini (Pro/Flash) and Free AI models (Groq, OpenRouter, Local Ollama) for WhatsApp Auto-Reply & Brain."""
+        tk = self.tk
+        win = self.dialog("Google Gemini & Free AI Setup", "620x680")
+        tk.Label(win, text="Google Gemini & Free AI Models Setup", font=(self.F, 14, "bold"), fg=self.RED, bg=self.BG
+                 ).pack(anchor="w", padx=16, pady=(14, 2))
+        tk.Label(win, justify="left", wraplength=580, fg=self.RED_DIM, bg=self.BG, font=(self.F, 9), text=(
+            "Configure how PAC understands and replies to incoming WhatsApp messages (and powers the AI Brain).\n"
+            "• Google Gemini: Paste your Gemini API key from aistudio.google.com/apikey (supports Gemini 2.5 Pro & Flash).\n"
+            "• Free Cloud AI: Paste a free API key from console.groq.com/keys (Llama 3.3 70B) or openrouter.ai/keys.\n"
+            "• Local Ollama: Uses your local Ollama models (e.g. qwen2.5:3b or llama3.1:8b) with zero API keys required!"
+        )).pack(anchor="w", padx=16, pady=(0, 8))
+
+        cur_lbl = tk.Label(win, text=f"Active WhatsApp AI: {active_wa_ai_summary(self.cfg)}",
+                           font=(self.F, 9, "bold"), fg=self.GREEN, bg=self.BG)
+        cur_lbl.pack(anchor="w", padx=16, pady=(0, 6))
+
+        # --- Provider selection
+        prov_row = tk.Frame(win, bg=self.BG)
+        prov_row.pack(fill="x", padx=16, pady=4)
+        tk.Label(prov_row, text="WhatsApp AI Engine:", width=20, anchor="w", fg=self.RED_TEXT, bg=self.BG,
+                 font=(self.F, 10, "bold")).pack(side="left")
+        wa_prov_var = tk.StringVar(value=self.cfg.get("wa_ai_provider") or "auto")
+        self.styled_option(prov_row, wa_prov_var, ["auto", "gemini", "groq", "openrouter", "ollama", "claude", "free"]).pack(side="left")
+
+        brain_row = tk.Frame(win, bg=self.BG)
+        brain_row.pack(fill="x", padx=16, pady=4)
+        tk.Label(brain_row, text="PAC Brain Provider:", width=20, anchor="w", fg=self.RED_TEXT, bg=self.BG,
+                 font=(self.F, 10, "bold")).pack(side="left")
+        brain_prov_var = tk.StringVar(value=self.cfg.get("brain_provider") or "ollama")
+        self.styled_option(brain_row, brain_prov_var, list(BRAIN_PROVIDERS)).pack(side="left")
+
+        # --- Google Gemini
+        tk.Label(win, text="1. Google Gemini (Gemini 2.5 Flash / 2.5 Pro — Premium or Free AI Studio Key)",
+                 font=(self.F, 10, "bold"), fg=self.RED, bg=self.BG).pack(anchor="w", padx=16, pady=(10, 2))
+        g_row1 = tk.Frame(win, bg=self.BG)
+        g_row1.pack(fill="x", padx=16, pady=2)
+        tk.Label(g_row1, text="Gemini API Key", width=16, anchor="w", fg=self.RED_TEXT, bg=self.BG, font=(self.F, 9)).pack(side="left")
+        gem_key_e = self._entry(g_row1, show="*")
+        gem_key_e.pack(side="left", fill="x", expand=True, ipady=4)
+        if gemini_key_get(self.cfg):
+            gem_key_e.insert(0, gemini_key_get(self.cfg))
+        self.mkbtn(g_row1, "Get Key", lambda: webbrowser.open("https://aistudio.google.com/apikey")).pack(side="left", padx=(6, 0))
+
+        g_row2 = tk.Frame(win, bg=self.BG)
+        g_row2.pack(fill="x", padx=16, pady=2)
+        tk.Label(g_row2, text="Gemini Model", width=16, anchor="w", fg=self.RED_TEXT, bg=self.BG, font=(self.F, 9)).pack(side="left")
+        gem_mod_var = tk.StringVar(value=self.cfg.get("gemini_model") or GEMINI_MODELS[0][0])
+        self.styled_option(g_row2, gem_mod_var, [m[0] for m in GEMINI_MODELS]).pack(side="left")
+
+        # --- Groq Free AI
+        tk.Label(win, text="2. Groq Free Cloud AI (Ultra-Fast Llama 3.3 70B — Free API Key)",
+                 font=(self.F, 10, "bold"), fg=self.RED, bg=self.BG).pack(anchor="w", padx=16, pady=(10, 2))
+        q_row1 = tk.Frame(win, bg=self.BG)
+        q_row1.pack(fill="x", padx=16, pady=2)
+        tk.Label(q_row1, text="Groq API Key", width=16, anchor="w", fg=self.RED_TEXT, bg=self.BG, font=(self.F, 9)).pack(side="left")
+        groq_key_e = self._entry(q_row1, show="*")
+        groq_key_e.pack(side="left", fill="x", expand=True, ipady=4)
+        if groq_key_get(self.cfg):
+            groq_key_e.insert(0, groq_key_get(self.cfg))
+        self.mkbtn(q_row1, "Get Free Key", lambda: webbrowser.open("https://console.groq.com/keys")).pack(side="left", padx=(6, 0))
+
+        q_row2 = tk.Frame(win, bg=self.BG)
+        q_row2.pack(fill="x", padx=16, pady=2)
+        tk.Label(q_row2, text="Groq Model", width=16, anchor="w", fg=self.RED_TEXT, bg=self.BG, font=(self.F, 9)).pack(side="left")
+        groq_mod_var = tk.StringVar(value=self.cfg.get("groq_model") or GROQ_MODELS[0][0])
+        self.styled_option(q_row2, groq_mod_var, [m[0] for m in GROQ_MODELS]).pack(side="left")
+
+        # --- OpenRouter Free AI
+        tk.Label(win, text="3. OpenRouter Free AI Models (Gemini 2.0 Flash / Llama 3.3 Free)",
+                 font=(self.F, 10, "bold"), fg=self.RED, bg=self.BG).pack(anchor="w", padx=16, pady=(10, 2))
+        or_row1 = tk.Frame(win, bg=self.BG)
+        or_row1.pack(fill="x", padx=16, pady=2)
+        tk.Label(or_row1, text="OpenRouter Key", width=16, anchor="w", fg=self.RED_TEXT, bg=self.BG, font=(self.F, 9)).pack(side="left")
+        or_key_e = self._entry(or_row1, show="*")
+        or_key_e.pack(side="left", fill="x", expand=True, ipady=4)
+        if openrouter_key_get(self.cfg):
+            or_key_e.insert(0, openrouter_key_get(self.cfg))
+        self.mkbtn(or_row1, "Get Free Key", lambda: webbrowser.open("https://openrouter.ai/keys")).pack(side="left", padx=(6, 0))
+
+        or_row2 = tk.Frame(win, bg=self.BG)
+        or_row2.pack(fill="x", padx=16, pady=2)
+        tk.Label(or_row2, text="OpenRouter Model", width=16, anchor="w", fg=self.RED_TEXT, bg=self.BG, font=(self.F, 9)).pack(side="left")
+        or_mod_var = tk.StringVar(value=self.cfg.get("openrouter_model") or OPENROUTER_MODELS[0][0])
+        self.styled_option(or_row2, or_mod_var, [m[0] for m in OPENROUTER_MODELS]).pack(side="left")
+
+        # --- Local Ollama
+        tk.Label(win, text="4. Local Ollama Model (100% Free & Offline — No API Key Needed)",
+                 font=(self.F, 10, "bold"), fg=self.RED, bg=self.BG).pack(anchor="w", padx=16, pady=(10, 2))
+        ol_row = tk.Frame(win, bg=self.BG)
+        ol_row.pack(fill="x", padx=16, pady=2)
+        tk.Label(ol_row, text="Ollama Model", width=16, anchor="w", fg=self.RED_TEXT, bg=self.BG, font=(self.F, 9)).pack(side="left")
+        ol_mod_e = self._entry(ol_row)
+        ol_mod_e.pack(side="left", fill="x", expand=True, ipady=4)
+        ol_mod_e.insert(0, self.cfg.get("ollama_model") or "qwen2.5:3b")
+
+        status_lbl = tk.Label(win, text="", justify="left", wraplength=580, fg=self.GREEN, bg=self.BG, font=(self.F, 9, "italic"))
+        status_lbl.pack(anchor="w", padx=16, pady=(8, 4))
+
+        def do_save(test=False):
+            gk = gem_key_e.get().strip()
+            qk = groq_key_e.get().strip()
+            ork = or_key_e.get().strip()
+            gemini_key_set(self.cfg, gk)
+            groq_key_set(self.cfg, qk)
+            openrouter_key_set(self.cfg, ork)
+            self.cfg["gemini_model"] = gem_mod_var.get().strip()
+            self.cfg["groq_model"] = groq_mod_var.get().strip()
+            self.cfg["openrouter_model"] = or_mod_var.get().strip()
+            self.cfg["ollama_model"] = ol_mod_e.get().strip() or "qwen2.5:3b"
+            self.cfg["wa_ai_provider"] = wa_prov_var.get().strip()
+            self.cfg["brain_provider"] = brain_prov_var.get().strip()
+            save_config(self.cfg)
+            summary = active_wa_ai_summary(self.cfg)
+            cur_lbl.configure(text=f"Active WhatsApp AI: {summary}")
+            self.ui("log", "sys", f"AI settings saved. Active WhatsApp AI Engine: {summary}")
+            if not test:
+                win.destroy()
+                return
+            status_lbl.configure(text="Testing WhatsApp AI understanding with sample message: 'Can you bring milk and bread on the way home?'...")
+
+            def test_worker():
+                sample_msg = "Can you bring milk and bread on the way home?"
+                rep = generate_whatsapp_auto_reply("Appa", sample_msg, preloaded=self.cfg.get("messages"), cfg=self.cfg, use_ai=True)
+                self.ui("log", "sys", f"AI Test -> Incoming: \"{sample_msg}\"  |  AI Reply: \"{rep}\"")
+                try:
+                    if win.winfo_exists():
+                        win.after(0, lambda: status_lbl.configure(text=f"Test Reply: \"{rep}\""))
+                except Exception:
+                    pass
+
+            threading.Thread(target=test_worker, daemon=True).start()
+
+        btn_bar = tk.Frame(win, bg=self.BG)
+        btn_bar.pack(fill="x", padx=16, pady=10)
+        self.mkbtn(btn_bar, "Save", lambda: do_save(False)).pack(side="left", padx=(0, 8))
+        self.mkbtn(btn_bar, "Save & Test AI Understanding", lambda: do_save(True)).pack(side="left")
+        self.mkbtn(btn_bar, "Close", win.destroy).pack(side="right")
+
+    def msg_lab_dialog(self):
+        """Interactive console for WhatsApp Auto-Read & Contextual Auto-Reply (works with zero predefined numbers)."""
+        tk = self.tk
+        win = self.dialog("WhatsApp Auto-Reply Console", "580x530")
+        tk.Label(win, text="WhatsApp Auto-Read & Contextual Auto-Reply", font=(self.F, 14, "bold"), fg=self.RED, bg=self.BG
+                 ).pack(anchor="w", padx=16, pady=(14, 2))
+        tk.Label(win, justify="left", wraplength=540, fg=self.RED_DIM, bg=self.BG, font=(self.F, 9), text=(
+            "PAC reads incoming 1-on-1 WhatsApp messages, understands their exact meaning using AI (Google Gemini, "
+            "Free Groq/OpenRouter, or Local Ollama), and automatically replies accordingly. "
+            "Works with zero predefined phone numbers. Group chats are ignored."
+        )).pack(anchor="w", padx=16, pady=(0, 6))
+
+        ai_lbl = tk.Label(win, text=f"AI Engine: {active_wa_ai_summary(self.cfg)}",
+                          font=(self.F, 9, "bold"), fg=self.GREEN, bg=self.BG)
+        ai_lbl.pack(anchor="w", padx=16, pady=(0, 6))
+
+        mode_row = tk.Frame(win, bg=self.BG)
+        mode_row.pack(fill="x", padx=16, pady=4)
+        auto_v = tk.BooleanVar(value=bool(self.assistant.wa_auto_reply_on))
+        tk.Checkbutton(mode_row, text="Continuous Background WhatsApp Auto-Reply", variable=auto_v,
+                       command=lambda: self.toggle_wa_auto(auto_v.get()), bg=self.BG, fg=self.RED_TEXT,
+                       selectcolor=self.BG, activebackground=self.BG, activeforeground=self.RED,
+                       font=(self.F, 10, "bold"), highlightthickness=0, bd=0).pack(anchor="w")
+
+        test_v = tk.BooleanVar(value=bool(self.assistant.msg_perms.get("test_mode", False)))
+
+        def toggle_test():
+            self.assistant.msg_perms["test_mode"] = bool(test_v.get())
+            self.append("sys", "Switched to Sandbox Test Mode." if test_v.get() else "Switched to Live WhatsApp Mode.")
+
+        tk.Checkbutton(mode_row, text="Sandbox Test Mode (simulate without sending on live WhatsApp)", variable=test_v,
+                       command=toggle_test, bg=self.BG, fg=self.RED_DIM, selectcolor=self.BG,
+                       activebackground=self.BG, activeforeground=self.RED, font=(self.F, 9),
+                       highlightthickness=0, bd=0).pack(anchor="w", pady=(2, 6))
+
+        act_row = tk.Frame(win, bg=self.BG)
+        act_row.pack(fill="x", padx=16, pady=(2, 12))
+        self.mkbtn(act_row, "Read & Auto-Reply Now", lambda: self.submit("read and auto reply whatsapp")).pack(side="left", padx=(0, 8))
+        self.mkbtn(act_row, "Gemini & Free AI Setup...", self.ai_setup_dialog).pack(side="left", padx=(0, 8))
+        self.mkbtn(act_row, "Reset Test", lambda: self.submit("reset test messages")).pack(side="left")
+
+        tk.Label(win, text="Test / Trigger with Any Custom Incoming Message (No Phone Number Needed)",
+                 font=(self.F, 10, "bold"), fg=self.RED, bg=self.BG).pack(anchor="w", padx=16, pady=(8, 4))
+        f1 = tk.Frame(win, bg=self.BG)
+        f1.pack(fill="x", padx=16, pady=2)
+        tk.Label(f1, text="Sender Name", width=13, anchor="w", fg=self.RED_TEXT, bg=self.BG, font=(self.F, 10)).pack(side="left")
+        sender_e = self._entry(f1)
+        sender_e.pack(side="left", fill="x", expand=True, ipady=4)
+
+        f2 = tk.Frame(win, bg=self.BG)
+        f2.pack(fill="x", padx=16, pady=4)
+        tk.Label(f2, text="Incoming Text", width=13, anchor="w", fg=self.RED_TEXT, bg=self.BG, font=(self.F, 10)).pack(side="left")
+        msg_e = self._entry(f2)
+        msg_e.pack(side="left", fill="x", expand=True, ipady=4)
+
+        preview_lbl = tk.Label(win, text="", justify="left", wraplength=540, fg=self.GREEN, bg=self.BG, font=(self.F, 9, "italic"))
+        preview_lbl.pack(anchor="w", padx=16, pady=(6, 4))
+
+        def run_sim():
+            who = sender_e.get().strip() or "Friend"
+            txt = msg_e.get().strip()
+            if not txt:
+                preview_lbl.configure(text="Enter an incoming message text to test.")
+                return
+            preview_lbl.configure(text="Understanding message with AI...")
+            win.update_idletasks()
+            rep = generate_whatsapp_auto_reply(who, txt, preloaded=self.cfg.get("messages"), cfg=self.cfg, use_ai=True)
+            preview_lbl.configure(text=f"AI Auto-Reply generated: \"{rep}\"")
+            self.submit(f"simulate whatsapp from {who} saying {txt}")
+
+        bot = tk.Frame(win, bg=self.BG)
+        bot.pack(fill="x", padx=16, pady=10)
+        self.mkbtn(bot, "Read & Auto-Reply to This Message", run_sim).pack(side="left")
+        self.mkbtn(bot, "Close", win.destroy).pack(side="right")
 
     # ----- memory
     def toggle_memory(self):
@@ -14971,20 +17314,22 @@ class PacApp:
     def _update_pills(self):
         if not getattr(self, "pills", None):
             return
+        wa_auto_on = bool(getattr(self.assistant, "wa_auto_reply_on", False))
         states = {
-            "mode":   (self.mode == "voice", f"\u25cf Voice" if self.mode == "voice" else "\u25cb Text"),
-            "mic":    (self.mic_on, f"\u25cf Mic" if self.mic_on else "\u25cb Mic Off"),
-            "clap":   (bool(self.cfg.get("sound_triggers", True)), "\u25cf Clap Wake" if self.cfg.get("sound_triggers", True) else "\u25cb Clap Wake"),
-            "gest":   (bool(self.gesture.running or self.gest_var.get()), "\u25cf Gestures" if (self.gesture.running or self.gest_var.get()) else "\u25cb Gestures"),
-            "air":    (bool(self.airdrag_var.get()), "\u25cf Air Drag" if self.airdrag_var.get() else "\u25cb Air Drag"),
-            "face":   (bool(self.faces.running or self.face_var.get()), "\u25cf Face ID" if (self.faces.running or self.face_var.get()) else "\u25cb Face ID"),
-            "ar":     (bool(self.ar.running or self.ar_var.get()), "\u25cf AR Vision" if (self.ar.running or self.ar_var.get()) else "\u25cb AR Vision"),
-            "claude": (bool(getattr(self.assistant, "claude_on", False)), "\u25cf Claude AI" if getattr(self.assistant, "claude_on", False) else "\u25cb Claude AI"),
+            "mode":    (self.mode == "voice", f"\u25cf Voice" if self.mode == "voice" else "\u25cb Text"),
+            "mic":     (self.mic_on, f"\u25cf Mic" if self.mic_on else "\u25cb Mic Off"),
+            "clap":    (bool(self.cfg.get("sound_triggers", True)), "\u25cf Clap Wake" if self.cfg.get("sound_triggers", True) else "\u25cb Clap Wake"),
+            "gest":    (bool(self.gesture.running or self.gest_var.get()), "\u25cf Gestures" if (self.gesture.running or self.gest_var.get()) else "\u25cb Gestures"),
+            "air":     (bool(self.airdrag_var.get()), "\u25cf Air Drag" if self.airdrag_var.get() else "\u25cb Air Drag"),
+            "face":    (bool(self.faces.running or self.face_var.get()), "\u25cf Face ID" if (self.faces.running or self.face_var.get()) else "\u25cb Face ID"),
+            "ar":      (bool(self.ar.running or self.ar_var.get()), "\u25cf AR Vision" if (self.ar.running or self.ar_var.get()) else "\u25cb AR Vision"),
+            "wa_auto": (wa_auto_on, "\u25cf WA Auto-Reply" if wa_auto_on else "\u25cb WA Auto-Reply"),
+            "claude":  (bool(getattr(self.assistant, "claude_on", False)), "\u25cf Claude AI" if getattr(self.assistant, "claude_on", False) else "\u25cb Claude AI"),
         }
         for key, (on, txt) in states.items():
             btn = self.pills.get(key)
             if btn:
-                fg = self.GREEN if (on and key in ("mic", "gest", "face", "ar")) else (self.RED if on else self.RED_DIM)
+                fg = self.GREEN if (on and key in ("mic", "gest", "face", "ar", "wa_auto")) else (self.RED if on else self.RED_DIM)
                 bg = self.SURFACE_ALT if on else self.SURFACE
                 bdr = fg if on else self.RED_DEEP
                 if btn.cget("text") != txt or btn.cget("fg") != fg:
@@ -15137,6 +17482,15 @@ class PacApp:
                         self.assistant.say("I can't reach the internet, so I've switched to text mode.")
                 elif kind == "autostart_state":
                     self.autostart_var.set(bool(ev[1]))
+                elif kind == "wa_auto_state":
+                    self.wa_auto_var.set(bool(ev[1]))
+                    self._update_pills()
+                elif kind == "msg_lab_open":
+                    self.msg_lab_dialog()
+                elif kind == "msg_perms_updated":
+                    self._update_pills()
+                elif kind == "ai_setup":
+                    self.ai_setup_dialog()
                 elif kind == "quit":
                     self.quit_when_quiet()
         except queue.Empty:

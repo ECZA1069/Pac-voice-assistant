@@ -12,6 +12,13 @@ env/
 .env
 credentials.json
 token.json
+.env.*
+!.env.example
+config.json
+*.key
+wa_msg_cache.json
+wa_replied_ids.json
+.pac/
 pac_memory.json
 pac_timetable.json
 pac_contacts.json
