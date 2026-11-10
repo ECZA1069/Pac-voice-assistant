@@ -18,6 +18,7 @@ config.json
 *.key
 wa_msg_cache.json
 wa_replied_ids.json
+gmail_handled_ids.json
 .pac/
 pac_memory.json
 pac_timetable.json

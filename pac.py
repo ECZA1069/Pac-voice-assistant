@@ -130,6 +130,7 @@ DATA_DIR.mkdir(exist_ok=True)
 CONFIG_FILE = DATA_DIR / "config.json"
 LOG_FILE = DATA_DIR / "pac.log"
 WA_REPLIED_FILE = DATA_DIR / "wa_replied_ids.json"
+GMAIL_HANDLED_FILE = DATA_DIR / "gmail_handled_ids.json"   # emails already approved / rejected in the reply popup
 ICON_FILE = DATA_DIR / "pac_blue.ico"
 NOTES_FILE = HOME / "pac_notes.txt"
 KNOWLEDGE_DIR = DATA_DIR / "knowledge"
@@ -163,6 +164,10 @@ DEFAULT_CONFIG = {
     "wa_delay": 7,            # seconds to wait for WhatsApp before pressing Enter
     "confirm_send": True,     # ask "shall I send it?" before sending manual WhatsApp messages
     "wa_auto_reply": True,    # background watcher that automatically reads incoming WhatsApp messages and replies back accordingly
+    "gmail_auto_reply": False, # background Gmail watcher: AI drafts a professional reply, you approve/reject it in a desktop popup
+    "gmail_ai_provider": "auto",  # auto (first AI with an API key) | gemini | groq | openrouter | claude
+    "gmail_poll_secs": 60,    # how often the Gmail auto-reply watcher checks for new unread mail
+    "owner_name": "",         # name used to sign professional email replies (blank = taken from your Gmail address)
     "online_fallback": "ask", # only used when background_search is off: "ask" = ask before Google, "yes" = just open it, "no" = never
     "background_search": True, # a question with no offline answer is searched on the web quietly: no question, no browser window
     "search_engine": "google", # "google" = Google through a hidden Chrome/Edge (DuckDuckGo if it refuses), "duckduckgo" = DuckDuckGo only
@@ -2220,6 +2225,37 @@ class MailBox:
             items.append(item)
         return total, items
 
+    def get_body(self, uid, limit=6000):
+        """The plain-text body of one email (HTML is converted to text). Reading never marks it as read."""
+        d = self._api("GET", f"/messages/{uid}", {"format": "full"})
+
+        def walk(part):
+            mt = (part.get("mimeType") or "").lower()
+            data = (part.get("body") or {}).get("data")
+            if data and mt in ("text/plain", "text/html"):
+                raw = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)).decode("utf-8", "replace")
+                yield mt, raw
+            for sub in part.get("parts") or []:
+                yield from walk(sub)
+
+        found = list(walk(d.get("payload") or {}))
+        text = next((t for mt, t in found if mt == "text/plain" and t.strip()), "")
+        if not text:
+            h = next((t for mt, t in found if mt == "text/html"), "")
+            h = re.sub(r"(?is)<(script|style).*?</\1>", " ", h)
+            h = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>", "\n", h)
+            text = html.unescape(re.sub(r"<[^>]+>", " ", h))
+        kept = []
+        for line in text.splitlines():                     # drop the quoted earlier conversation
+            if re.match(r"^\s*>", line) or re.match(r"^\s*On .{5,120} wrote:\s*$", line):
+                break
+            kept.append(line.rstrip())
+        text = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+        return (text or html.unescape(d.get("snippet", "") or ""))[:limit]
+
+    def mark_read(self, uid):
+        return self._api("POST", f"/messages/{uid}/modify", body={"removeLabelIds": ["UNREAD"]})
+
     def send_reply(self, item, reply_text):
         """Send a 1-on-1 email reply in the same thread via Gmail API. Refuses group/mailing-list messages."""
         is_grp, grp_reason = is_gmail_group(item)
@@ -2720,6 +2756,160 @@ def generate_whatsapp_auto_reply(sender, text, subject="", preloaded=None, cfg=N
     if len(hist) > 8:
         del hist[:-8]
     return fallback_reply
+
+
+# --------------------------------------------------------------- Gmail AI auto-reply (approve / reject in a desktop popup)
+GMAIL_AI_PROVIDERS = ("gemini", "groq", "openrouter", "claude")      # API-key providers used for professional email replies
+_GMAIL_SKIP_LABELS = {"CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL", "CATEGORY_UPDATES", "CATEGORY_FORUMS", "SPAM", "TRASH", "SENT", "DRAFT"}
+
+
+def gmail_ai_providers(cfg):
+    """[(provider, label)] for every email-capable AI that has an API key, in the order PAC will try them."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    keyed = {
+        "gemini": (gemini_key_get(cfg), f"Google Gemini ({cfg.get('gemini_model') or GEMINI_MODELS[0][0]})"),
+        "groq": (groq_key_get(cfg), f"Groq ({cfg.get('groq_model') or GROQ_MODELS[0][0]})"),
+        "openrouter": (openrouter_key_get(cfg), f"OpenRouter ({cfg.get('openrouter_model') or OPENROUTER_MODELS[0][0]})"),
+        "claude": (claude_key_get(cfg), f"Anthropic Claude ({cfg.get('claude_model') or CLAUDE_MODELS[0][0]})"),
+    }
+    pref = str(cfg.get("gmail_ai_provider") or "auto").lower()
+    order = ([pref] if pref in keyed else []) + [p for p in GMAIL_AI_PROVIDERS if p != pref]
+    return [(p, keyed[p][1]) for p in order if keyed[p][0]]
+
+
+def gmail_owner_name(cfg):
+    name = str((cfg or {}).get("owner_name") or "").strip()
+    if name:
+        return name
+    local = str((cfg or {}).get("mail_address") or "").split("@")[0]
+    parts = [w for w in re.split(r"[._\-+]+", re.sub(r"\d+", "", local)) if w]
+    return " ".join(w.capitalize() for w in parts[:2])
+
+
+def _gmail_ask(cfg, prov, system, user, timeout=45, max_tokens=1800):
+    hist = [{"role": "user", "content": user}]
+    if prov == "gemini":
+        return ask_gemini(gemini_key_get(cfg), cfg.get("gemini_model") or GEMINI_MODELS[0][0], hist,
+                          timeout=timeout, system_override=system, max_tokens=max_tokens)
+    if prov == "groq":
+        return ask_groq(groq_key_get(cfg), cfg.get("groq_model") or GROQ_MODELS[0][0], hist,
+                        timeout=timeout, system_override=system, max_tokens=max_tokens)
+    if prov == "openrouter":
+        return ask_openrouter(openrouter_key_get(cfg), cfg.get("openrouter_model") or OPENROUTER_MODELS[0][0], hist,
+                              timeout=timeout, system_override=system, max_tokens=max_tokens)
+    if prov == "claude":
+        return ask_claude(claude_key_get(cfg), cfg.get("claude_model") or CLAUDE_MODELS[0][0], hist,
+                          timeout=timeout, system_override=system, max_tokens=max_tokens)
+    raise ClaudeError(f"unknown AI provider {prov}", "error")
+
+
+def _parse_gmail_draft(raw):
+    """Pull {summary, reply, reply_summary} out of the model's answer (JSON, fenced JSON, or labelled text)."""
+    txt = str(raw or "").strip()
+    txt = re.sub(r"^```(?:json)?\s*|\s*```$", "", txt, flags=re.I).strip()
+    m = re.search(r"\{.*\}", txt, re.S)
+    if m:
+        try:
+            d = json.loads(m.group(0))
+            if isinstance(d, dict) and str(d.get("reply") or "").strip():
+                return {k: str(d.get(k) or "").strip() for k in ("summary", "reply", "reply_summary")}
+        except ValueError:
+            pass
+    parts = {}
+    for key, pat in (("summary", r"SUMMARY\s*:"), ("reply_summary", r"REPLY[_ ]SUMMARY\s*:"), ("reply", r"REPLY\s*:")):
+        mm = re.search(pat + r"\s*(.*?)(?=\n\s*(?:SUMMARY|REPLY[_ ]SUMMARY|REPLY)\s*:|\Z)", txt, re.S | re.I)
+        if mm:
+            parts[key] = mm.group(1).strip()
+    if parts.get("reply"):
+        return {"summary": parts.get("summary", ""), "reply": parts["reply"], "reply_summary": parts.get("reply_summary", "")}
+    return {"summary": "", "reply": txt, "reply_summary": ""}
+
+
+def generate_gmail_reply_draft(cfg, item, body_text):
+    """Ask an AI (with your API key) to summarise the email and write a professional, on-topic reply.
+    Returns {summary, reply, reply_summary, provider}. Raises ClaudeError('no_key') when no API key is set."""
+    providers = gmail_ai_providers(cfg)
+    if not providers:
+        raise ClaudeError("no AI API key is set for Gmail replies - add a Google Gemini, Groq, OpenRouter or "
+                          "Claude key in the Gemini & Free AI Setup window", "no_key")
+    me = gmail_owner_name(cfg) or "the account owner"
+    sender = str(item.get("name") or item.get("addr") or "the sender").strip()
+    first = sender.split()[0] if sender and "@" not in sender else ""
+    system = (
+        f"You are an executive assistant drafting email replies on behalf of {me}. "
+        "Write a professional, courteous and concise reply that sticks strictly to the topic of the email.\n"
+        "RULES:\n"
+        f"1. Open with a professional greeting addressed to the sender (e.g. 'Dear {first or 'Sir/Madam'},' or 'Hi {first or 'there'},').\n"
+        "2. Respond only to the points, questions and requests actually raised in the email - in the same order. "
+        "No small talk, no unrelated content, no filler.\n"
+        "3. Never invent facts, figures, dates, prices, attachments or commitments that are not in the email. "
+        "Where a decision or detail from the owner is needed, say it will be confirmed shortly instead of making it up.\n"
+        "4. Keep a polite, confident, formal business tone; 60 to 160 words in the body; plain text only (no markdown, no emojis).\n"
+        f"5. Close with 'Best regards,' followed by '{me}' on the next line.\n"
+        "6. Do not include a subject line.\n"
+        "Return ONLY valid JSON with exactly these keys:\n"
+        '{"summary": "<one or two sentences: what the incoming email is about / asks for>", '
+        '"reply": "<the full reply email text, use \\n for new lines>", '
+        '"reply_summary": "<one sentence: what the reply says / commits to>"}'
+    )
+    user = (f"From: {sender} <{item.get('addr', '')}>\nSubject: {item.get('subject', '')}\n\n"
+            f"Email body:\n{(body_text or item.get('snippet') or '').strip()[:6000]}")
+    errors = []
+    for prov, label in providers:
+        try:
+            raw = _gmail_ask(cfg, prov, system, user)
+        except ClaudeError as e:
+            errors.append(f"{label}: {e}")
+            logger.warning("gmail draft via %s failed: %s", prov, e)
+            continue
+        d = _parse_gmail_draft(raw)
+        reply = d["reply"].replace("\\n", "\n").strip().strip('"').strip()
+        if len(reply) < 20:
+            errors.append(f"{label}: reply too short")
+            continue
+        reply = re.sub(r"(?im)^subject\s*:.*\n+", "", reply).strip()
+        return {"summary": d["summary"] or (item.get("snippet") or "")[:220],
+                "reply": reply,
+                "reply_summary": d["reply_summary"] or reply.split("\n")[min(2, len(reply.split("\n")) - 1)][:220],
+                "provider": label}
+    raise ClaudeError("none of your AI keys could draft a reply (" + "; ".join(errors)[:400] + ")", "error")
+
+
+def _load_gmail_handled_ids():
+    try:
+        if GMAIL_HANDLED_FILE.exists():
+            data = json.loads(GMAIL_HANDLED_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return set(str(x) for x in data)
+    except Exception:
+        logger.exception("could not read gmail handled ids")
+    return set()
+
+
+def _save_gmail_handled_ids(ids_set):
+    try:
+        GMAIL_HANDLED_FILE.write_text(json.dumps(sorted(ids_set)[-500:], indent=2), encoding="utf-8")
+    except Exception:
+        logger.exception("could not save gmail handled ids")
+
+
+def gmail_should_auto_reply(item, my_addr=""):
+    """(True, '') when an inbox email is a genuine 1-on-1 mail that deserves a reply, else (False, reason)."""
+    is_grp, why = is_gmail_group(item)
+    if is_grp:
+        return False, why
+    addr = str(item.get("addr") or "").lower()
+    if not addr or "@" not in addr:
+        return False, "no sender address"
+    if my_addr and addr == my_addr.lower():
+        return False, "sent by you"
+    labels = set(item.get("labels") or [])
+    if labels & _GMAIL_SKIP_LABELS:
+        return False, "promotions / social / updates / forums"
+    hdr = item.get("headers") or {}
+    if str(hdr.get("auto-submitted", "")).lower() not in ("", "no") or str(hdr.get("precedence", "")).lower() in ("bulk", "list", "junk"):
+        return False, "automated email"
+    return True, ""
 
 
 # Simulated inbox for Sandbox Test Mode only — contains NO predefined phone numbers
@@ -3789,7 +3979,7 @@ class ClaudeError(Exception):
         self.kind = kind      # no_key / auth / rate / offline / error
 
 
-def ask_gemini(api_key, model, history, timeout=30, system_extra="", system_override=None):
+def ask_gemini(api_key, model, history, timeout=30, system_extra="", system_override=None, max_tokens=400):
     """Call Google Gemini generateContent API using the standard library."""
     import urllib.request
     import urllib.error
@@ -3807,7 +3997,7 @@ def ask_gemini(api_key, model, history, timeout=30, system_extra="", system_over
     body = json.dumps({
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": contents,
-        "generationConfig": {"temperature": 0.45, "maxOutputTokens": 400},
+        "generationConfig": {"temperature": 0.45, "maxOutputTokens": int(max_tokens)},
     }).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json"})
     try:
@@ -3834,7 +4024,7 @@ def ask_gemini(api_key, model, history, timeout=30, system_extra="", system_over
     return re.sub(r"[*_#`]+", "", text)
 
 
-def _ask_openai_chat(url, api_key, model, history, timeout=25, system_extra="", system_override=None, provider_label="AI"):
+def _ask_openai_chat(url, api_key, model, history, timeout=25, system_extra="", system_override=None, provider_label="AI", max_tokens=350):
     """Call an OpenAI-compatible Chat Completions endpoint (Groq / OpenRouter) using only the standard library."""
     import urllib.request
     import urllib.error
@@ -3845,7 +4035,7 @@ def _ask_openai_chat(url, api_key, model, history, timeout=25, system_extra="", 
         {"role": ("assistant" if m.get("role") == "assistant" else "user"), "content": str(m.get("content") or "")}
         for m in (history or [])
     ]
-    body = json.dumps({"model": model, "messages": msgs, "max_tokens": 350, "temperature": 0.45}).encode("utf-8")
+    body = json.dumps({"model": model, "messages": msgs, "max_tokens": int(max_tokens), "temperature": 0.45}).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
@@ -3875,7 +4065,7 @@ def _ask_openai_chat(url, api_key, model, history, timeout=25, system_extra="", 
     return re.sub(r"[*_#`]+", "", text)
 
 
-def ask_groq(api_key, model, history, timeout=25, system_extra="", system_override=None):
+def ask_groq(api_key, model, history, timeout=25, system_extra="", system_override=None, max_tokens=350):
     return _ask_openai_chat(
         "https://api.groq.com/openai/v1/chat/completions",
         api_key,
@@ -3885,10 +4075,11 @@ def ask_groq(api_key, model, history, timeout=25, system_extra="", system_overri
         system_extra=system_extra,
         system_override=system_override,
         provider_label="Groq",
+        max_tokens=max_tokens,
     )
 
 
-def ask_openrouter(api_key, model, history, timeout=25, system_extra="", system_override=None):
+def ask_openrouter(api_key, model, history, timeout=25, system_extra="", system_override=None, max_tokens=350):
     return _ask_openai_chat(
         "https://openrouter.ai/api/v1/chat/completions",
         api_key,
@@ -3898,10 +4089,11 @@ def ask_openrouter(api_key, model, history, timeout=25, system_extra="", system_
         system_extra=system_extra,
         system_override=system_override,
         provider_label="OpenRouter",
+        max_tokens=max_tokens,
     )
 
 
-def ask_claude(api_key, model, history, timeout=40, url="https://api.anthropic.com/v1/messages", system_extra="", system_override=None):
+def ask_claude(api_key, model, history, timeout=40, url="https://api.anthropic.com/v1/messages", system_extra="", system_override=None, max_tokens=400):
     """One round trip to the Claude Messages API using only the standard library. `history` is a list of
     {"role": "user"|"assistant", "content": str} ending with the user's message. Returns the reply text."""
     import urllib.request
@@ -3909,7 +4101,7 @@ def ask_claude(api_key, model, history, timeout=40, url="https://api.anthropic.c
     if not api_key:
         raise ClaudeError("no API key set", "no_key")
     system = system_override if system_override is not None else (CLAUDE_SYSTEM + ("\n\n" + system_extra if system_extra else ""))
-    body = json.dumps({"model": model, "max_tokens": 400, "system": system, "messages": history}).encode()
+    body = json.dumps({"model": model, "max_tokens": int(max_tokens), "system": system, "messages": history}).encode()
     req = urllib.request.Request(url, data=body, method="POST", headers={
         "content-type": "application/json", "x-api-key": api_key, "anthropic-version": "2023-06-01"})
     try:
@@ -8417,6 +8609,13 @@ class Assistant:
         self.wa_last_direct = []
         self.gmail_last_direct = []
         threading.Thread(target=self._wa_auto_reply_loop, daemon=True).start()
+        self.gmail_auto_reply_on = bool(cfg.get("gmail_auto_reply", False))
+        self._gmail_handled = _load_gmail_handled_ids()   # emails already approved / rejected (persisted)
+        self._gmail_pending = {}                          # uid -> {"item", "draft", "test"} waiting in a popup
+        self._gmail_auto_lock = threading.Lock()
+        self._gmail_last_poll = 0.0
+        self._gmail_warned = set()
+        threading.Thread(target=self._gmail_auto_reply_loop, daemon=True).start()
         C = lambda p, fn: (re.compile(p), fn)
         self.commands = [
             C(STOP_SPEAKING.pattern, self.c_stop),
@@ -8429,6 +8628,11 @@ class Assistant:
             C(r"^reset\s+(?:the\s+)?(?:test|sandbox|simulated)\s+(?:messages?|inbox|whatsapp|gmail)$", self.c_msg_test_reset),
             C(r"^(?:(?P<on>turn on|enable|start|activate|switch on)|(?P<off>turn off|disable|stop|deactivate|switch off))\s+(?:the\s+)?(?:whatsapp\s+)?auto[- ]?reply(?:\s+(?:on\s+whatsapp|for\s+whatsapp|mode))?$|^whatsapp\s+auto[- ]?reply\s+(?P<st>on|off)$|^auto[- ]?reply\s+(?:whatsapp\s+)?(?P<st2>on|off)$", self.c_wa_auto_reply_toggle),
             C(r"^simulate\s+(?:a\s+|an\s+)?(?:incoming\s+)?whatsapp(?:\s+message)?\s+from\s+(?P<who>.+?)\s+(?:saying|that|with\s+text|message)\s+(?P<txt>.+)$", self.c_wa_simulate_msg),
+            C(r"^(?:(?P<on>turn on|enable|start|activate|switch on)|(?P<off>turn off|disable|stop|deactivate|switch off))\s+(?:the\s+)?(?:gmail|e-?mail|mail)\s+auto[- ]?reply(?:\s+mode)?$|^(?:gmail|e-?mail|mail)\s+auto[- ]?reply\s+(?P<st>on|off)$", self.c_gmail_auto_toggle),
+            C(r"^(?:check|scan|read)\s+(?:my\s+)?(?:gmail|e-?mails?|mails?|inbox)\s+(?:and\s+)?(?:draft|prepare|write|suggest)\s+(?:ai\s+|professional\s+)?repl(?:y|ies)$|^(?:draft|prepare|write)\s+(?:ai\s+|professional\s+)?(?:gmail|e-?mail|mail)\s+repl(?:y|ies)(?:\s+now)?$|^gmail\s+auto[- ]?reply\s+now$", self.c_gmail_draft_now),
+            C(r"^(?:test|show|preview)\s+(?:the\s+)?(?:gmail|e-?mail|mail)\s+(?:approval|reply)\s+(?:popup|pop[- ]up|notification|window)$", self.c_gmail_test_popup),
+            C(r"^simulate\s+(?:a\s+|an\s+)?(?:incoming\s+)?(?:gmail|e-?mail|mail)\s+from\s+(?P<who>.+?)(?:\s+subject\s+(?P<subj>.+?))?\s+(?:saying|that|with\s+text|body)\s+(?P<txt>.+)$", self.c_gmail_simulate_msg),
+            C(r"^(?:use|switch to|set)\s+(?:google\s+)?(?P<gp>gemini|groq|openrouter|claude|auto)\s+(?:for|on|in)\s+(?:gmail|e-?mails?|mail)(?:\s+auto[- ]?reply)?$", self.c_gmail_ai_provider),
             C(r"^(?:review|choose|pick)\s+(?:my\s+)?whatsapp\s+(?:replies|options|messages\s+manually)$", self.c_wa_read_reply),
             C(r"^(?:(?:auto[- ]?reply|automatically\s+reply)(?:\s+to)?(?:\s+my|\s+the|\s+all|\s+unread|\s+latest|\s+new)*\s+whatsapp(?:\s+(?:messages?|chats?|inbox|notifications?))?|(?:check|read|show|get|fetch|review|scan|test)(?: me)?(?: my| the| all| any)*(?: new| unread| latest| incoming| test| simulated)*\s+whatsapp(?:\s+(?:messages?|chats?|inbox|notifications?))?(?:\s+(?:and\s+)?(?:auto[- ]?reply|reply(?:\s+back)?(?:\s+automatically|\s+accordingly)?|send\s+(?:a\s+)?reply|suggest\s+replies|with\s+prebuilt\s+replies))?|do i have (?:any )?(?:new |unread )?whatsapp(?:\s+messages?)?|any (?:new |unread )?whatsapp(?:\s+messages?)?|read(?:\s+and\s+(?:auto[- ]?)?reply\s+to)?\s+whatsapp|reply\s+(?:back\s+)?to\s+(?:my\s+)?whatsapp(?:\s+(?:messages?|automatically|accordingly))?)$", self.c_wa_auto_read_reply),
             C(r"^(?:(?:read|check|review|test)(?: me)?(?: my| the| all| any)?(?: new| unread| latest| incoming| test| simulated)*\s+(?:gmail|e-?mails?|mails?)\s+(?:and\s+(?:reply|suggest\s+replies|give\s+prebuilt\s+replies)|with\s+(?:prebuilt\s+|smart\s+)?replies)|smart\s+reply\s+(?:to\s+)?(?:my\s+)?(?:gmail|e-?mails?|mails?)|reply\s+to\s+(?:my\s+)?(?:unread\s+|latest\s+|new\s+)?(?:gmail|e-?mails?|mails?)|read\s+(?:my\s+)?gmail(?:\s+messages?)?|test\s+(?:my\s+)?(?:gmail|e-?mail)\s+(?:messages?|replies))$", self.c_mail_read_reply),
@@ -10129,6 +10333,8 @@ class Assistant:
         self.gmail_test_inbox = [dict(x) for x in DEFAULT_TEST_GMAIL_MESSAGES]
         self._wa_replied_ids.clear()
         _save_wa_replied_ids(self._wa_replied_ids)
+        self._gmail_handled = {u for u in self._gmail_handled if not u.startswith("gm_")}
+        _save_gmail_handled_ids(self._gmail_handled)
         self.notify("msg_perms_updated", dict(self.msg_perms))
         self.say("Simulated WhatsApp and Gmail test messages have been reset.")
 
@@ -10154,6 +10360,224 @@ class Assistant:
                 threading.Thread(target=lambda: self._wa_run_auto_read_reply(quiet_if_empty=True), daemon=True).start()
             else:
                 self.say("WhatsApp Auto-Reply mode is now OFF.")
+
+    # ---------- Gmail AI auto-reply: AI drafts a professional reply, you approve or reject it in a desktop popup
+    def c_gmail_auto_toggle(self, m, t):
+        gd = m.groupdict()
+        self.set_gmail_auto_reply(bool(gd.get("on") or gd.get("st") == "on"), announce=True)
+
+    def set_gmail_auto_reply(self, on, announce=True):
+        on = bool(on)
+        self.gmail_auto_reply_on = on
+        self.cfg["gmail_auto_reply"] = on
+        save_config(self.cfg)
+        if on:
+            self.msg_perms["gmail_read_reply"] = True
+        self.notify("gmail_auto_state", on)
+        self.notify("msg_perms_updated", dict(self.msg_perms))
+        if not announce:
+            return
+        if not on:
+            self.say("Gmail auto-reply is off.")
+            return
+        provs = gmail_ai_providers(self.cfg)
+        test = bool(self.msg_perms.get("test_mode", False))
+        if not provs:
+            self.say("Gmail auto-reply is on, but it needs an AI API key to write professional replies. "
+                     "I've opened the Gemini and Free AI setup box - paste your Gemini, Groq, OpenRouter or Claude key.")
+            self.notify("ai_setup", None)
+        elif not test and not self.mailbox.configured():
+            self.say("Gmail auto-reply is on, but Gmail isn't connected yet. I've opened the email setup.")
+            self.notify("mail_setup", None)
+        else:
+            self.say(f"Gmail auto-reply is on, using {provs[0][1]}. For every new 1-on-1 email I'll draft a "
+                     "professional reply and show you a desktop popup to approve or reject it. Nothing is sent "
+                     "without your approval.")
+            self._gmail_last_poll = 0.0
+
+    def c_gmail_ai_provider(self, m, t):
+        gp = (m.group("gp") or "auto").lower()
+        self.cfg["gmail_ai_provider"] = gp
+        save_config(self.cfg)
+        provs = gmail_ai_providers(self.cfg)
+        if gp != "auto" and not any(p == gp for p, _ in provs):
+            self.say(f"Gmail replies set to {gp}, but there's no {gp} API key yet. I've opened the setup box.")
+            self.notify("ai_setup", None)
+        else:
+            self.say(f"Gmail replies will be written by {provs[0][1] if provs else gp}.")
+
+    def c_gmail_draft_now(self, m, t):
+        self.msg_perms["gmail_read_reply"] = True
+        threading.Thread(target=lambda: self._gmail_run_auto_reply(quiet=False), daemon=True).start()
+
+    def c_gmail_test_popup(self, m, t):
+        """Show the approval popup for a sample email (Sandbox: approving it sends nothing)."""
+        sample = dict(DEFAULT_TEST_GMAIL_MESSAGES[0])
+        sample["uid"] = f"gm_popup_test_{int(time.time())}"
+        threading.Thread(target=lambda: self._gmail_draft_and_ask(sample, test=True, announce=True), daemon=True).start()
+
+    def c_gmail_simulate_msg(self, m, t):
+        """Simulate an incoming 1-on-1 Gmail message and open the Windows desktop approval popup with an AI-drafted professional reply."""
+        who = (m.group("who") or "Sender").strip()
+        subj = (m.group("subj") or "Follow-up & Next Steps").strip()
+        txt = (m.group("txt") or "").strip()
+        slug = re.sub(r"[^a-z0-9]+", ".", who.lower()).strip(".") or "sender"
+        addr = who if "@" in who else f"{slug}@company.com"
+        sample = {
+            "uid": f"gm_sim_custom_{int(time.time() * 1000)}",
+            "name": who,
+            "addr": addr,
+            "subject": subj,
+            "snippet": txt,
+            "is_group": False,
+            "recipient_count": 1,
+            "headers": {},
+            "labels": ["INBOX", "UNREAD"],
+        }
+        threading.Thread(target=lambda: self._gmail_draft_and_ask(sample, test=True, announce=True), daemon=True).start()
+
+    def _gmail_auto_reply_loop(self):
+        """Background watcher: while Gmail auto-reply is on, checks for new unread 1-on-1 mail every gmail_poll_secs."""
+        while True:
+            time.sleep(5.0)
+            if not self.gmail_auto_reply_on or self.asleep:
+                continue
+            every = max(20, int(self.cfg.get("gmail_poll_secs", 60) or 60))
+            if time.time() - self._gmail_last_poll < every:
+                continue
+            self._gmail_last_poll = time.time()
+            try:
+                self._gmail_run_auto_reply(quiet=True)
+            except Exception:
+                logger.exception("gmail auto reply loop error")
+
+    def _gmail_warn_once(self, key, text, notify_kind=None):
+        if key in self._gmail_warned:
+            return
+        self._gmail_warned.add(key)
+        self.emit("sys", text)
+        if notify_kind:
+            self.notify(notify_kind, None)
+
+    def _gmail_run_auto_reply(self, quiet=True):
+        if not self._gmail_auto_lock.acquire(blocking=False):
+            return
+        try:
+            test = bool(self.msg_perms.get("test_mode", False))
+            if not gmail_ai_providers(self.cfg):
+                msg = ("Gmail auto-reply needs an AI API key (Google Gemini, Groq, OpenRouter or Claude). "
+                       "Open Menu > Contacts and messages > Google Gemini & Free AI Setup.")
+                if quiet:
+                    self._gmail_warn_once("nokey", msg, "ai_setup")
+                else:
+                    self.say(msg)
+                    self.notify("ai_setup", None)
+                return
+            if test:
+                items = [dict(x) for x in self.gmail_test_inbox]
+            else:
+                if not self.mailbox.configured():
+                    msg = "Gmail isn't connected yet. Use Menu > Knowledge and mail > Email setup to sign in."
+                    if quiet:
+                        self._gmail_warn_once("nomail", msg, "mail_setup")
+                    else:
+                        self.say(msg)
+                        self.notify("mail_setup", None)
+                    return
+                try:
+                    _total, items = self.mailbox.recent(unread_only=True, limit=10)
+                except MailAuthError as e:
+                    self._gmail_warn_once(f"auth:{e}", f"Gmail auto-reply couldn't read your inbox: {e}")
+                    return
+                except Exception as e:
+                    logger.warning("gmail auto reply fetch failed: %s", e)
+                    if not quiet:
+                        self.say(f"I couldn't reach Gmail: {e}")
+                    return
+            my_addr = str(self.cfg.get("mail_address") or "")
+            todo, skipped = [], 0
+            for it in items:
+                uid = str(it.get("uid") or "")
+                if not uid or uid in self._gmail_handled or uid in self._gmail_pending:
+                    continue
+                ok, why = gmail_should_auto_reply(it, my_addr)
+                if not ok:
+                    skipped += 1
+                    self._gmail_handled.add(uid)
+                    continue
+                todo.append(it)
+            _save_gmail_handled_ids(self._gmail_handled)
+            if not todo:
+                if not quiet:
+                    self.say("No new 1-on-1 emails need a reply right now." +
+                             (f" I skipped {skipped} newsletter, group or automated mail(s)." if skipped else ""))
+                return
+            if not quiet:
+                self.say(f"Drafting professional replies for {len(todo)} email(s). Each one will pop up on your desktop for approval.")
+            for it in todo:
+                self._gmail_draft_and_ask(it, test=test, announce=not quiet)
+        finally:
+            self._gmail_auto_lock.release()
+
+    def _gmail_draft_and_ask(self, item, test=False, announce=False):
+        uid = str(item.get("uid"))
+        try:
+            body = item.get("snippet", "") if test else self.mailbox.get_body(uid)
+        except Exception as e:
+            logger.warning("gmail body fetch failed: %s", e)
+            body = item.get("snippet", "")
+        try:
+            draft = generate_gmail_reply_draft(self.cfg, item, body)
+        except ClaudeError as e:
+            self.emit("sys", f"[GMAIL AUTO-REPLY] Couldn't draft a reply to {item.get('name')}: {e}")
+            if e.kind == "no_key":
+                self.notify("ai_setup", None)
+            return
+        self._gmail_pending[uid] = {"item": item, "draft": draft, "test": test}
+        self.emit("sys", f"[GMAIL AUTO-REPLY] Reply drafted for \"{item.get('subject')}\" from {item.get('name')} "
+                         f"({draft['provider']}). Waiting for your approval in the desktop popup.")
+        self.notify("gmail_approval", {"uid": uid, "item": item, "draft": draft, "test": test})
+        if announce:
+            self._speak(f"New email reply ready for approval: {item.get('name')}.")
+
+    def gmail_approval_decision(self, uid, approved, reply_text=None):
+        """Called by the desktop popup. approved=True sends the (possibly edited) reply; False discards it."""
+        p = self._gmail_pending.pop(str(uid), None)
+        if not p:
+            return
+        item, test = p["item"], p["test"]
+        self._gmail_handled.add(str(uid))
+        _save_gmail_handled_ids(self._gmail_handled)
+        if not approved:
+            self.emit("sys", f"[GMAIL AUTO-REPLY] Rejected - no reply sent to {item.get('name')} (\"{item.get('subject')}\").")
+            return
+        text = (reply_text or p["draft"]["reply"]).strip()
+        if test:
+            self.emit("sys", f"[SANDBOX TEST MODE] Approved reply to {item.get('name')} <{item.get('addr')}> "
+                             f"(not actually sent):\n{text}")
+            self.say(f"Approved. In test mode, so nothing was sent to {item.get('name')}.")
+            return
+        try:
+            self.mailbox.send_reply(item, text)
+            try:
+                self.mailbox.mark_read(uid)
+            except Exception:
+                pass
+            self.emit("sys", f"[GMAIL AUTO-REPLY] Sent reply to {item.get('name')} <{item.get('addr')}> "
+                             f"in thread \"{item.get('subject')}\".")
+            self.say(f"Reply sent to {item.get('name')}.")
+        except Exception as e:
+            logger.exception("gmail send failed")
+            self._gmail_handled.discard(str(uid))
+            _save_gmail_handled_ids(self._gmail_handled)
+            self.emit("sys", f"[GMAIL AUTO-REPLY] Sending to {item.get('name')} failed: {e}")
+            self.say(f"Sorry, I couldn't send the reply to {item.get('name')}.")
+
+    def gmail_regenerate(self, uid):
+        """Popup 'Regenerate' button: asks the AI for a fresh draft and re-shows the popup."""
+        p = self._gmail_pending.pop(str(uid), None)
+        if p:
+            threading.Thread(target=lambda: self._gmail_draft_and_ask(p["item"], test=p["test"]), daemon=True).start()
 
     def _wa_auto_reply_loop(self):
         """Background watcher: when WhatsApp Auto-Reply mode is enabled, checks every 2 seconds for new incoming
@@ -15075,6 +15499,12 @@ class PacApp:
             self.ui("msg_perms_updated", value)
         elif kind == "ai_setup":
             self.ui("ai_setup")
+        elif kind == "gmail_approval":
+            self.ui("gmail_approval", value)
+        elif kind == "gmail_auto_state":
+            self.ui("gmail_auto_state", value)
+        elif kind == "mail_setup":
+            self.ui("mail_setup")
 
     def recognition_wanted(self):
         """Voice mode with a working microphone switch: speech goes to Google."""
@@ -15162,6 +15592,7 @@ class PacApp:
         make_pill("face", "Face ID", lambda: self.set_faces(not self.face_var.get()))
         make_pill("ar", "AR Vision", lambda: self.set_ar(not self.ar_var.get()))
         make_pill("wa_auto", "WA Auto-Reply", lambda: self.toggle_wa_auto(not self.wa_auto_var.get()))
+        make_pill("gmail_auto", "Gmail Auto", lambda: self.toggle_gmail_auto(not self.gmail_auto_var.get()))
         make_pill("claude", "Claude AI", lambda: (self.claude_var.set(not self.claude_var.get()), self.toggle_claude()))
 
         self.live = tk.Label(r, text="", font=(self.F, 10, "italic"), fg=self.GREEN, bg=self.BG,
@@ -15189,6 +15620,7 @@ class PacApp:
         tk.Label(chips, text="Quick:", font=(self.F, 9, "bold"), fg=self.RED_DIM, bg=self.BG).pack(side="left", padx=(0, 6))
         for lbl, cmd in [
             ("WA Auto-Reply", lambda: self.submit("read and auto reply whatsapp")),
+            ("Gmail Auto-Reply", lambda: self.submit("check gmail and draft replies")),
             ("Schedule", lambda: self.submit("what's my schedule today")),
             ("Battery", lambda: self.submit("battery")),
             ("Solve x\u00b2+5x+6=0", lambda: self.submit("solve x^2 + 5x + 6 = 0")),
@@ -15411,7 +15843,9 @@ class PacApp:
         self.wa_auto_var = tk.BooleanVar(value=bool(self.cfg.get("wa_auto_reply", True)))
         c.add_checkbutton(label="WhatsApp Auto-Reply mode (auto-read & reply)", variable=self.wa_auto_var,
                           command=lambda: self.toggle_wa_auto(self.wa_auto_var.get()))
-        c.add_command(label="WhatsApp Auto-Reply Console...", command=self.msg_lab_dialog)
+        c.add_command(label="Check Gmail & draft AI replies now", command=lambda: self.submit("check gmail and draft replies"))
+        c.add_command(label="Test Gmail approval desktop popup", command=lambda: self.submit("test gmail approval popup"))
+        c.add_command(label="WhatsApp & Gmail Auto-Reply Console...", command=self.msg_lab_dialog)
         c.add_command(label="Google Gemini & Free AI Setup (API keys, models)...", command=self.ai_setup_dialog)
         c.add_separator()
         c.add_command(label="Edit contacts...", command=self.edit_contacts)
@@ -15430,6 +15864,13 @@ class PacApp:
         k.add_command(label="Check my mail", command=lambda: self.submit("check my mail"))
         k.add_command(label="Review my mail", command=lambda: self.submit("review my mail"))
         k.add_command(label="Email setup...", command=self.mail_setup)
+        k.add_separator()
+        self.gmail_auto_var = tk.BooleanVar(value=bool(self.cfg.get("gmail_auto_reply", False)))
+        k.add_checkbutton(label="Gmail AI Auto-Reply (approve each reply in a desktop popup)", variable=self.gmail_auto_var,
+                          command=lambda: self.assistant.set_gmail_auto_reply(self.gmail_auto_var.get()))
+        k.add_command(label="Check Gmail & draft replies now", command=lambda: self.submit("check gmail and draft replies"))
+        k.add_command(label="Test the Gmail approval popup (sample email)", command=lambda: self.submit("test gmail approval popup"))
+        k.add_command(label="AI keys for Gmail replies (Gemini, Groq, OpenRouter, Claude)...", command=self.ai_setup_dialog)
 
         # --- Memory
         mm = sub(menu, "Memory")
@@ -16889,10 +17330,181 @@ class PacApp:
                          "Say:  send message 2 to mom",
                          "\n".join(self.cfg["messages"]), save)
 
+    # ----- Gmail reply approval: a notification-style popup in the bottom-right corner of the Windows desktop
+    def gmail_popup_enqueue(self, payload):
+        if not hasattr(self, "_gmail_popup_queue"):
+            self._gmail_popup_queue, self._gmail_popup_win = [], None
+        if any(p.get("uid") == payload.get("uid") for p in self._gmail_popup_queue):
+            return
+        self._gmail_popup_queue.append(payload)
+        win = self._gmail_popup_win
+        if win is not None and win.winfo_exists():
+            self._gmail_popup_more()
+        else:
+            self._gmail_popup_show_next()
+
+    def _gmail_popup_more(self):
+        lbl = getattr(self, "_gmail_popup_more_lbl", None)
+        n = len(getattr(self, "_gmail_popup_queue", []))
+        if lbl is not None and lbl.winfo_exists():
+            lbl.configure(text=f"+{n} more waiting" if n else "")
+
+    @staticmethod
+    def _desktop_work_area(root):
+        """(left, top, right, bottom) of the desktop above the taskbar."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            r = wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0):
+                return r.left, r.top, r.right, r.bottom
+        except Exception:
+            pass
+        return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight() - 48
+
+    def _gmail_popup_show_next(self):
+        q = getattr(self, "_gmail_popup_queue", [])
+        if not q:
+            self._gmail_popup_win = None
+            return
+        p = q.pop(0)
+        uid, item, draft, test = p["uid"], p["item"], p["draft"], p.get("test")
+        tk = self.tk
+        W, H = 470, 560
+        win = tk.Toplevel(self.root)
+        self._gmail_popup_win = win
+        win.overrideredirect(True)                      # no title bar: looks like a Windows notification card
+        win.attributes("-topmost", True)
+        try:
+            win.attributes("-toolwindow", True)
+        except Exception:
+            pass
+        win.configure(bg=self.RED_DEEP)
+        L, T, R, B = self._desktop_work_area(self.root)
+        x, y_end = R - W - 14, B - H - 14
+        win.geometry(f"{W}x{H}+{x}+{B}")
+        card = tk.Frame(win, bg=self.SURFACE, highlightthickness=1, highlightbackground=self.RED)
+        card.pack(fill="both", expand=True, padx=1, pady=1)
+
+        head = tk.Frame(card, bg="#0E1A30")
+        head.pack(fill="x")
+        tk.Label(head, text="\u2709  PAC  \u2022  Gmail reply approval" + ("  (TEST MODE)" if test else ""),
+                 font=(self.F, 10, "bold"), fg=self.RED, bg="#0E1A30").pack(side="left", padx=12, pady=8)
+        self._gmail_popup_more_lbl = tk.Label(head, text="", font=(self.F, 8), fg=self.AMBER, bg="#0E1A30")
+        self._gmail_popup_more_lbl.pack(side="left")
+        close = tk.Label(head, text="\u2715", font=(self.F, 11), fg=self.RED_DIM, bg="#0E1A30", cursor="hand2")
+        close.pack(side="right", padx=12)
+        drag = {}
+        head.bind("<ButtonPress-1>", lambda e: drag.update(x=e.x_root - win.winfo_x(), y=e.y_root - win.winfo_y()))
+        head.bind("<B1-Motion>", lambda e: win.geometry(f"+{e.x_root - drag.get('x', 0)}+{e.y_root - drag.get('y', 0)}"))
+
+        body = tk.Frame(card, bg=self.SURFACE)
+        body.pack(fill="both", expand=True, padx=14, pady=(8, 4))
+
+        def row(label, value, fg=None, bold=False):
+            f = tk.Frame(body, bg=self.SURFACE)
+            f.pack(fill="x", pady=1)
+            tk.Label(f, text=label, width=8, anchor="nw", font=(self.F, 9), fg=self.RED_DIM, bg=self.SURFACE).pack(side="left")
+            tk.Label(f, text=value, anchor="w", justify="left", wraplength=W - 120, font=(self.F, 9, "bold" if bold else "normal"),
+                     fg=fg or self.RED_TEXT, bg=self.SURFACE).pack(side="left", fill="x")
+
+        row("From", f"{item.get('name', '')} <{item.get('addr', '')}>", bold=True)
+        row("Subject", item.get("subject", ""))
+        tk.Label(body, text="EMAIL SUMMARY", font=(self.FM, 8, "bold"), fg=self.RED_DIM, bg=self.SURFACE).pack(anchor="w", pady=(8, 0))
+        tk.Label(body, text=draft.get("summary", ""), wraplength=W - 40, justify="left", font=(self.F, 9),
+                 fg=self.RED_TEXT, bg=self.SURFACE).pack(anchor="w")
+        tk.Label(body, text="REPLY SUMMARY", font=(self.FM, 8, "bold"), fg=self.GREEN, bg=self.SURFACE).pack(anchor="w", pady=(8, 0))
+        tk.Label(body, text=draft.get("reply_summary", ""), wraplength=W - 40, justify="left", font=(self.F, 9, "italic"),
+                 fg=self.GREEN, bg=self.SURFACE).pack(anchor="w")
+        tk.Label(body, text="PROPOSED REPLY  (you can edit it before approving)", font=(self.FM, 8, "bold"),
+                 fg=self.RED_DIM, bg=self.SURFACE).pack(anchor="w", pady=(8, 2))
+        box = tk.Frame(body, bg=self.RED_DEEP, padx=1, pady=1)
+        box.pack(fill="both", expand=True)
+        txt = tk.Text(box, wrap="word", height=9, font=(self.F, 10), bg=self.BG, fg=self.RED_TEXT, relief="flat",
+                      insertbackground=self.RED, padx=8, pady=6, bd=0, highlightthickness=0)
+        sb = tk.Scrollbar(box, command=txt.yview, width=8)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        txt.insert("1.0", draft.get("reply", ""))
+        txt.bind("<Button-1>", lambda e: (win.focus_force(), txt.focus_set()))
+        tk.Label(card, text=f"Written by {draft.get('provider', 'AI')}  \u2022  nothing is sent until you approve",
+                 font=(self.F, 8), fg=self.RED_DIM, bg=self.SURFACE).pack(anchor="w", padx=14)
+
+        bar = tk.Frame(card, bg=self.SURFACE)
+        bar.pack(fill="x", padx=14, pady=(6, 12))
+        done = {"v": False}
+
+        def finish(approved):
+            if done["v"]:
+                return
+            done["v"] = True
+            text = txt.get("1.0", "end").strip()
+            threading.Thread(target=lambda: self.assistant.gmail_approval_decision(uid, approved, text), daemon=True).start()
+            close_and_next()
+
+        def regenerate():
+            if done["v"]:
+                return
+            done["v"] = True
+            self.append("sys", f"Asking the AI for a new draft for \"{item.get('subject', '')}\"...")
+            self.assistant.gmail_regenerate(uid)
+            close_and_next()
+
+        def close_and_next():
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self._gmail_popup_win = None
+            self.root.after(350, self._gmail_popup_show_next)
+
+        def later():                                     # hide for now; it comes back in 10 minutes
+            if done["v"]:
+                return
+            done["v"] = True
+            self.root.after(600000, lambda: self.gmail_popup_enqueue(p))
+            close_and_next()
+
+        def btn(text, cmd, bg, fg):
+            b = tk.Button(bar, text=text, command=cmd, font=(self.F, 10, "bold"), bg=bg, fg=fg, relief="flat", bd=0,
+                          padx=14, pady=6, cursor="hand2", activebackground=self.RED_TEXT, activeforeground=self.BG)
+            b.pack(side="left", padx=(0, 8))
+            return b
+
+        btn("\u2714  Approve & Send", lambda: finish(True), self.GREEN, self.BG)
+        btn("\u2716  Reject", lambda: finish(False), "#F87171", self.BG)
+        btn("\u21bb  Regenerate", regenerate, self.SURFACE_ALT, self.RED_TEXT)
+        close.bind("<Button-1>", lambda e: later())
+        self._gmail_popup_more()
+
+        try:
+            import winsound
+            winsound.MessageBeep(0x40)
+        except Exception:
+            pass
+
+        def slide(cur):                                  # slide up from the taskbar like a Windows toast
+            if not win.winfo_exists():
+                return
+            cur = max(y_end, cur - 38)
+            win.geometry(f"+{x}+{cur}")
+            if cur > y_end:
+                win.after(12, slide, cur)
+            else:
+                win.lift()
+        slide(B)
+
     def toggle_wa_auto(self, on):
         on = bool(on)
         self.wa_auto_var.set(on)
         self.assistant.set_wa_auto_reply(on, announce=True)
+        self._update_pills()
+
+    def toggle_gmail_auto(self, on):
+        on = bool(on)
+        self.gmail_auto_var.set(on)
+        self.assistant.set_gmail_auto_reply(on, announce=True)
         self._update_pills()
 
     def ai_setup_dialog(self):
@@ -16926,6 +17538,13 @@ class PacApp:
                  font=(self.F, 10, "bold")).pack(side="left")
         brain_prov_var = tk.StringVar(value=self.cfg.get("brain_provider") or "ollama")
         self.styled_option(brain_row, brain_prov_var, list(BRAIN_PROVIDERS)).pack(side="left")
+
+        gm_row = tk.Frame(win, bg=self.BG)
+        gm_row.pack(fill="x", padx=16, pady=4)
+        tk.Label(gm_row, text="Gmail Reply AI (key):", width=20, anchor="w", fg=self.RED_TEXT, bg=self.BG,
+                 font=(self.F, 10, "bold")).pack(side="left")
+        gmail_prov_var = tk.StringVar(value=self.cfg.get("gmail_ai_provider") or "auto")
+        self.styled_option(gm_row, gmail_prov_var, ["auto"] + list(GMAIL_AI_PROVIDERS)).pack(side="left")
 
         # --- Google Gemini
         tk.Label(win, text="1. Google Gemini (Gemini 2.5 Flash / 2.5 Pro — Premium or Free AI Studio Key)",
@@ -17007,6 +17626,7 @@ class PacApp:
             self.cfg["ollama_model"] = ol_mod_e.get().strip() or "qwen2.5:3b"
             self.cfg["wa_ai_provider"] = wa_prov_var.get().strip()
             self.cfg["brain_provider"] = brain_prov_var.get().strip()
+            self.cfg["gmail_ai_provider"] = gmail_prov_var.get().strip()
             save_config(self.cfg)
             summary = active_wa_ai_summary(self.cfg)
             cur_lbl.configure(text=f"Active WhatsApp AI: {summary}")
@@ -17035,19 +17655,21 @@ class PacApp:
         self.mkbtn(btn_bar, "Close", win.destroy).pack(side="right")
 
     def msg_lab_dialog(self):
-        """Interactive console for WhatsApp Auto-Read & Contextual Auto-Reply (works with zero predefined numbers)."""
+        """Interactive console for WhatsApp & Gmail AI Auto-Reply (works with zero predefined numbers)."""
         tk = self.tk
-        win = self.dialog("WhatsApp Auto-Reply Console", "580x530")
-        tk.Label(win, text="WhatsApp Auto-Read & Contextual Auto-Reply", font=(self.F, 14, "bold"), fg=self.RED, bg=self.BG
+        win = self.dialog("WhatsApp & Gmail Auto-Reply Console", "620x590")
+        tk.Label(win, text="WhatsApp & Gmail AI Auto-Reply", font=(self.F, 14, "bold"), fg=self.RED, bg=self.BG
                  ).pack(anchor="w", padx=16, pady=(14, 2))
-        tk.Label(win, justify="left", wraplength=540, fg=self.RED_DIM, bg=self.BG, font=(self.F, 9), text=(
-            "PAC reads incoming 1-on-1 WhatsApp messages, understands their exact meaning using AI (Google Gemini, "
-            "Free Groq/OpenRouter, or Local Ollama), and automatically replies accordingly. "
-            "Works with zero predefined phone numbers. Group chats are ignored."
+        tk.Label(win, justify="left", wraplength=580, fg=self.RED_DIM, bg=self.BG, font=(self.F, 9), text=(
+            "• WhatsApp: Reads incoming 1-on-1 messages, understands their meaning with AI, and replies automatically.\n"
+            "• Gmail: Uses your AI API key (Google Gemini, Groq, OpenRouter, or Claude) to write a professional, on-topic "
+            "reply and opens a Windows Desktop Notification Popup with a summary preview so you can Approve or Reject before sending."
         )).pack(anchor="w", padx=16, pady=(0, 6))
 
-        ai_lbl = tk.Label(win, text=f"AI Engine: {active_wa_ai_summary(self.cfg)}",
-                          font=(self.F, 9, "bold"), fg=self.GREEN, bg=self.BG)
+        gm_provs = gmail_ai_providers(self.cfg)
+        gm_lbl = gm_provs[0][1] if gm_provs else "No API key set yet (click 'Gemini & Free AI Setup...')"
+        ai_lbl = tk.Label(win, text=f"WhatsApp AI: {active_wa_ai_summary(self.cfg)}   |   Gmail API Key AI: {gm_lbl}",
+                          font=(self.F, 9, "bold"), fg=self.GREEN, bg=self.BG, wraplength=580, justify="left")
         ai_lbl.pack(anchor="w", padx=16, pady=(0, 6))
 
         mode_row = tk.Frame(win, bg=self.BG)
@@ -17058,38 +17680,44 @@ class PacApp:
                        selectcolor=self.BG, activebackground=self.BG, activeforeground=self.RED,
                        font=(self.F, 10, "bold"), highlightthickness=0, bd=0).pack(anchor="w")
 
+        gmauto_v = tk.BooleanVar(value=bool(self.assistant.gmail_auto_reply_on))
+        tk.Checkbutton(mode_row, text="Gmail AI Auto-Reply (Desktop Notification Popup -> Approve / Reject)", variable=gmauto_v,
+                       command=lambda: self.toggle_gmail_auto(gmauto_v.get()), bg=self.BG, fg=self.RED_TEXT,
+                       selectcolor=self.BG, activebackground=self.BG, activeforeground=self.RED,
+                       font=(self.F, 10, "bold"), highlightthickness=0, bd=0).pack(anchor="w", pady=(2, 0))
+
         test_v = tk.BooleanVar(value=bool(self.assistant.msg_perms.get("test_mode", False)))
 
         def toggle_test():
             self.assistant.msg_perms["test_mode"] = bool(test_v.get())
-            self.append("sys", "Switched to Sandbox Test Mode." if test_v.get() else "Switched to Live WhatsApp Mode.")
+            self.append("sys", "Switched to Sandbox Test Mode." if test_v.get() else "Switched to Live Mode.")
 
-        tk.Checkbutton(mode_row, text="Sandbox Test Mode (simulate without sending on live WhatsApp)", variable=test_v,
+        tk.Checkbutton(mode_row, text="Sandbox Test Mode (simulate without sending on live WhatsApp / Gmail)", variable=test_v,
                        command=toggle_test, bg=self.BG, fg=self.RED_DIM, selectcolor=self.BG,
                        activebackground=self.BG, activeforeground=self.RED, font=(self.F, 9),
                        highlightthickness=0, bd=0).pack(anchor="w", pady=(2, 6))
 
         act_row = tk.Frame(win, bg=self.BG)
-        act_row.pack(fill="x", padx=16, pady=(2, 12))
-        self.mkbtn(act_row, "Read & Auto-Reply Now", lambda: self.submit("read and auto reply whatsapp")).pack(side="left", padx=(0, 8))
-        self.mkbtn(act_row, "Gemini & Free AI Setup...", self.ai_setup_dialog).pack(side="left", padx=(0, 8))
-        self.mkbtn(act_row, "Reset Test", lambda: self.submit("reset test messages")).pack(side="left")
+        act_row.pack(fill="x", padx=16, pady=(2, 10))
+        self.mkbtn(act_row, "Reply WhatsApp Now", lambda: self.submit("read and auto reply whatsapp")).pack(side="left", padx=(0, 6))
+        self.mkbtn(act_row, "Check Gmail & Draft Replies", lambda: self.submit("check gmail and draft replies")).pack(side="left", padx=(0, 6))
+        self.mkbtn(act_row, "Gemini & Free AI Setup...", self.ai_setup_dialog).pack(side="left")
 
-        tk.Label(win, text="Test / Trigger with Any Custom Incoming Message (No Phone Number Needed)",
-                 font=(self.F, 10, "bold"), fg=self.RED, bg=self.BG).pack(anchor="w", padx=16, pady=(8, 4))
+        tk.Label(win, text="Test / Trigger with Any Custom Incoming WhatsApp or Gmail Message",
+                 font=(self.F, 10, "bold"), fg=self.RED, bg=self.BG).pack(anchor="w", padx=16, pady=(6, 4))
         f1 = tk.Frame(win, bg=self.BG)
         f1.pack(fill="x", padx=16, pady=2)
-        tk.Label(f1, text="Sender Name", width=13, anchor="w", fg=self.RED_TEXT, bg=self.BG, font=(self.F, 10)).pack(side="left")
+        tk.Label(f1, text="Sender / Subject", width=15, anchor="w", fg=self.RED_TEXT, bg=self.BG, font=(self.F, 10)).pack(side="left")
         sender_e = self._entry(f1)
         sender_e.pack(side="left", fill="x", expand=True, ipady=4)
 
         f2 = tk.Frame(win, bg=self.BG)
         f2.pack(fill="x", padx=16, pady=4)
-        tk.Label(f2, text="Incoming Text", width=13, anchor="w", fg=self.RED_TEXT, bg=self.BG, font=(self.F, 10)).pack(side="left")
+        tk.Label(f2, text="Incoming Text", width=15, anchor="w", fg=self.RED_TEXT, bg=self.BG, font=(self.F, 10)).pack(side="left")
         msg_e = self._entry(f2)
         msg_e.pack(side="left", fill="x", expand=True, ipady=4)
 
-        preview_lbl = tk.Label(win, text="", justify="left", wraplength=540, fg=self.GREEN, bg=self.BG, font=(self.F, 9, "italic"))
+        preview_lbl = tk.Label(win, text="", justify="left", wraplength=580, fg=self.GREEN, bg=self.BG, font=(self.F, 9, "italic"))
         preview_lbl.pack(anchor="w", padx=16, pady=(6, 4))
 
         def run_sim():
@@ -17104,9 +17732,16 @@ class PacApp:
             preview_lbl.configure(text=f"AI Auto-Reply generated: \"{rep}\"")
             self.submit(f"simulate whatsapp from {who} saying {txt}")
 
+        def run_gmail_popup_sim():
+            who = sender_e.get().strip() or "Prof. Sharma"
+            txt = msg_e.get().strip() or DEFAULT_TEST_GMAIL_MESSAGES[0]["snippet"]
+            preview_lbl.configure(text="Drafting professional Gmail reply with your AI API key & opening Desktop Popup...")
+            self.submit(f"simulate gmail from {who} saying {txt}")
+
         bot = tk.Frame(win, bg=self.BG)
         bot.pack(fill="x", padx=16, pady=10)
-        self.mkbtn(bot, "Read & Auto-Reply to This Message", run_sim).pack(side="left")
+        self.mkbtn(bot, "Test WhatsApp Reply", run_sim).pack(side="left", padx=(0, 8))
+        self.mkbtn(bot, "Test Gmail Desktop Popup", run_gmail_popup_sim).pack(side="left")
         self.mkbtn(bot, "Close", win.destroy).pack(side="right")
 
     # ----- memory
@@ -17315,21 +17950,23 @@ class PacApp:
         if not getattr(self, "pills", None):
             return
         wa_auto_on = bool(getattr(self.assistant, "wa_auto_reply_on", False))
+        gm_auto_on = bool(getattr(self.assistant, "gmail_auto_reply_on", False))
         states = {
-            "mode":    (self.mode == "voice", f"\u25cf Voice" if self.mode == "voice" else "\u25cb Text"),
-            "mic":     (self.mic_on, f"\u25cf Mic" if self.mic_on else "\u25cb Mic Off"),
-            "clap":    (bool(self.cfg.get("sound_triggers", True)), "\u25cf Clap Wake" if self.cfg.get("sound_triggers", True) else "\u25cb Clap Wake"),
-            "gest":    (bool(self.gesture.running or self.gest_var.get()), "\u25cf Gestures" if (self.gesture.running or self.gest_var.get()) else "\u25cb Gestures"),
-            "air":     (bool(self.airdrag_var.get()), "\u25cf Air Drag" if self.airdrag_var.get() else "\u25cb Air Drag"),
-            "face":    (bool(self.faces.running or self.face_var.get()), "\u25cf Face ID" if (self.faces.running or self.face_var.get()) else "\u25cb Face ID"),
-            "ar":      (bool(self.ar.running or self.ar_var.get()), "\u25cf AR Vision" if (self.ar.running or self.ar_var.get()) else "\u25cb AR Vision"),
-            "wa_auto": (wa_auto_on, "\u25cf WA Auto-Reply" if wa_auto_on else "\u25cb WA Auto-Reply"),
-            "claude":  (bool(getattr(self.assistant, "claude_on", False)), "\u25cf Claude AI" if getattr(self.assistant, "claude_on", False) else "\u25cb Claude AI"),
+            "mode":       (self.mode == "voice", f"\u25cf Voice" if self.mode == "voice" else "\u25cb Text"),
+            "mic":        (self.mic_on, f"\u25cf Mic" if self.mic_on else "\u25cb Mic Off"),
+            "clap":       (bool(self.cfg.get("sound_triggers", True)), "\u25cf Clap Wake" if self.cfg.get("sound_triggers", True) else "\u25cb Clap Wake"),
+            "gest":       (bool(self.gesture.running or self.gest_var.get()), "\u25cf Gestures" if (self.gesture.running or self.gest_var.get()) else "\u25cb Gestures"),
+            "air":        (bool(self.airdrag_var.get()), "\u25cf Air Drag" if self.airdrag_var.get() else "\u25cb Air Drag"),
+            "face":       (bool(self.faces.running or self.face_var.get()), "\u25cf Face ID" if (self.faces.running or self.face_var.get()) else "\u25cb Face ID"),
+            "ar":         (bool(self.ar.running or self.ar_var.get()), "\u25cf AR Vision" if (self.ar.running or self.ar_var.get()) else "\u25cb AR Vision"),
+            "wa_auto":    (wa_auto_on, "\u25cf WA Auto-Reply" if wa_auto_on else "\u25cb WA Auto-Reply"),
+            "gmail_auto": (gm_auto_on, "\u25cf Gmail Auto" if gm_auto_on else "\u25cb Gmail Auto"),
+            "claude":     (bool(getattr(self.assistant, "claude_on", False)), "\u25cf Claude AI" if getattr(self.assistant, "claude_on", False) else "\u25cb Claude AI"),
         }
         for key, (on, txt) in states.items():
             btn = self.pills.get(key)
             if btn:
-                fg = self.GREEN if (on and key in ("mic", "gest", "face", "ar", "wa_auto")) else (self.RED if on else self.RED_DIM)
+                fg = self.GREEN if (on and key in ("mic", "gest", "face", "ar", "wa_auto", "gmail_auto")) else (self.RED if on else self.RED_DIM)
                 bg = self.SURFACE_ALT if on else self.SURFACE
                 bdr = fg if on else self.RED_DEEP
                 if btn.cget("text") != txt or btn.cget("fg") != fg:
@@ -17491,6 +18128,13 @@ class PacApp:
                     self._update_pills()
                 elif kind == "ai_setup":
                     self.ai_setup_dialog()
+                elif kind == "gmail_approval":
+                    self.gmail_popup_enqueue(ev[1])
+                elif kind == "gmail_auto_state":
+                    self.gmail_auto_var.set(bool(ev[1]))
+                    self._update_pills()
+                elif kind == "mail_setup":
+                    self.mail_setup()
                 elif kind == "quit":
                     self.quit_when_quiet()
         except queue.Empty:

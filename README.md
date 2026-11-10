@@ -32,7 +32,16 @@ use gemini for whatsapp         pick the WhatsApp reply engine (gemini / groq / 
 use gemini as brain             use Gemini for PAC's main AI brain
 ask gemini <question>           one-off question to Gemini
 whatsapp auto reply on / off    toggle background auto-reply
+gmail auto reply on / off       toggle background Gmail AI reply watcher
+check gmail and draft replies   scan unread 1-on-1 emails & open desktop approval popups
+test gmail approval popup       preview the Windows desktop notification popup on a sample email
+use gemini for gmail            pick the API-key AI for Gmail replies (gemini / groq / openrouter / claude / auto)
 ```
+
+### NEW: Gmail AI Auto-Reply (Desktop Notification Approval Popup)
+- **Professional & Strictly On-Topic**: Uses your configured AI API key (**Google Gemini**, **Groq**, **OpenRouter**, or **Claude**) to read incoming 1-on-1 emails, summarize what the sender is asking, and draft a formal, courteous business reply that sticks strictly to the topic without inventing facts or dates.
+- **Windows Desktop Notification Popup**: Slides up from the bottom-right corner of your Windows desktop (above the taskbar) showing **From**, **Subject**, **Email Summary**, **Reply Summary Preview**, and an editable **Proposed Reply** box with **`✔ Approve & Send`**, **`✖ Reject`**, and **`↻ Regenerate`** buttons. Nothing is ever sent without your approval.
+- **Skips Group & Bulk Mail**: Automatically ignores mailing lists, newsletters, `no-reply` senders, and promotions/social/updates tabs.
 
 > **API keys are never stored in this repository.** Paste them in the setup window (kept in your OS credential store / local config) or use environment variables — see [`.env.example`](.env.example).
 
